@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { tmpdir } from "node:os";
+import { captureEnv } from "./test-env.js";
 
 function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -11,33 +12,18 @@ function writeJson(path: string, value: unknown): void {
 }
 
 describe("cli init helper", () => {
-  const originalHome = process.env.HOME;
-  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-  const originalPackageDir = process.env.PI_PACKAGE_DIR;
-  const originalArcAgentDir = process.env.ARC_CODING_AGENT_DIR;
+  const restoreEnv = captureEnv(["HOME", "PI_CODING_AGENT_DIR", "PI_PACKAGE_DIR", "ARC_CODING_AGENT_DIR"]);
   const originalCwd = process.cwd();
 
   beforeEach(() => {
+    delete process.env.PI_CODING_AGENT_DIR;
+    delete process.env.PI_PACKAGE_DIR;
+    delete process.env.ARC_CODING_AGENT_DIR;
     vi.resetModules();
   });
 
   afterEach(() => {
-    process.env.HOME = originalHome;
-    if (originalAgentDir === undefined) {
-      delete process.env.PI_CODING_AGENT_DIR;
-    } else {
-      process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-    }
-    if (originalPackageDir === undefined) {
-      delete process.env.PI_PACKAGE_DIR;
-    } else {
-      process.env.PI_PACKAGE_DIR = originalPackageDir;
-    }
-    if (originalArcAgentDir === undefined) {
-      delete process.env.ARC_CODING_AGENT_DIR;
-    } else {
-      process.env.ARC_CODING_AGENT_DIR = originalArcAgentDir;
-    }
+    restoreEnv();
     process.chdir(originalCwd);
   });
 
@@ -45,6 +31,7 @@ describe("cli init helper", () => {
     const home = mkdtempSync(join(tmpdir(), "pi-mcp-cli-home-"));
     const project = mkdtempSync(join(tmpdir(), "pi-mcp-cli-project-"));
     process.env.HOME = home;
+    delete process.env.PI_CODING_AGENT_DIR;
     process.chdir(project);
 
     writeJson(join(home, ".claude", "mcp.json"), {

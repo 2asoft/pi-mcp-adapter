@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { captureEnv } from "./test-env.ts";
 
 function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -23,16 +24,20 @@ function writeManifest(plugin: string, name: string): void {
 
 describe("Claude plugin bundles", () => {
   const roots: string[] = [];
-  const originalHome = process.env.HOME;
+  let restoreEnv: () => void;
   const originalCwd = process.cwd();
 
   beforeEach(() => {
+    restoreEnv = captureEnv(["HOME", "PI_CODING_AGENT_DIR", "PI_PACKAGE_DIR", "PI_MCP_CONFIG_PATH", "PI_MCP_CONFIG"]);
+    delete process.env.PI_PACKAGE_DIR;
+    delete process.env.PI_MCP_CONFIG_PATH;
+    delete process.env.PI_MCP_CONFIG;
     vi.resetModules();
   });
 
   afterEach(() => {
     vi.doUnmock("node:fs");
-    process.env.HOME = originalHome;
+    restoreEnv();
     process.chdir(originalCwd);
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
     vi.restoreAllMocks();
@@ -44,6 +49,7 @@ describe("Claude plugin bundles", () => {
     const plugin = join(project, "plugins", "acme-tools");
     roots.push(home, project);
     process.env.HOME = home;
+    process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
     process.chdir(project);
     return { home, project, plugin };
   }
