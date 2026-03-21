@@ -1,47 +1,41 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { captureEnv } from "./test-env.js";
+
+const tempDirs: string[] = [];
+const restoreEnv = captureEnv([
+  "HOME",
+  "MCP_OAUTH_DIR",
+  "PI_CODING_AGENT_DIR",
+  "PI_PACKAGE_DIR",
+  "ARC_CODING_AGENT_DIR",
+]);
+
+function createTempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "pi-mcp-adapter-"));
+  tempDirs.push(dir);
+  return dir;
+}
 
 describe("Pi agent dir paths", () => {
-  const originalHome = process.env.HOME;
-  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-  const originalOAuthDir = process.env.MCP_OAUTH_DIR;
-  const originalPackageDir = process.env.PI_PACKAGE_DIR;
-  const originalArcAgentDir = process.env.ARC_CODING_AGENT_DIR;
-
   beforeEach(() => {
     vi.resetModules();
     delete process.env.PI_PACKAGE_DIR;
   });
 
   afterEach(() => {
-    process.env.HOME = originalHome;
-    if (originalAgentDir === undefined) {
-      delete process.env.PI_CODING_AGENT_DIR;
-    } else {
-      process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-    }
-    if (originalOAuthDir === undefined) {
-      delete process.env.MCP_OAUTH_DIR;
-    } else {
-      process.env.MCP_OAUTH_DIR = originalOAuthDir;
-    }
-    if (originalPackageDir === undefined) {
-      delete process.env.PI_PACKAGE_DIR;
-    } else {
-      process.env.PI_PACKAGE_DIR = originalPackageDir;
-    }
-    if (originalArcAgentDir === undefined) {
-      delete process.env.ARC_CODING_AGENT_DIR;
-    } else {
-      process.env.ARC_CODING_AGENT_DIR = originalArcAgentDir;
+    restoreEnv();
+
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it("uses PI_CODING_AGENT_DIR for Pi-owned config and state files", async () => {
-    const home = mkdtempSync(join(tmpdir(), "pi-mcp-agent-dir-home-"));
-    const agentDir = mkdtempSync(join(tmpdir(), "pi-mcp-agent-dir-"));
+    const home = createTempDir();
+    const agentDir = createTempDir();
     process.env.HOME = home;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     delete process.env.MCP_OAUTH_DIR;
@@ -65,7 +59,7 @@ describe("Pi agent dir paths", () => {
   });
 
   it("expands tilde in PI_CODING_AGENT_DIR", async () => {
-    const home = mkdtempSync(join(tmpdir(), "pi-mcp-agent-dir-home-"));
+    const home = createTempDir();
     process.env.HOME = home;
     process.env.PI_CODING_AGENT_DIR = "~/custom-pi-agent";
 
@@ -75,9 +69,9 @@ describe("Pi agent dir paths", () => {
   });
 
   it("uses the branded host environment key and config directory", async () => {
-    const home = mkdtempSync(join(tmpdir(), "pi-mcp-agent-dir-home-"));
-    const packageDir = mkdtempSync(join(tmpdir(), "pi-mcp-package-dir-"));
-    const agentDir = mkdtempSync(join(tmpdir(), "pi-mcp-agent-dir-"));
+    const home = createTempDir();
+    const packageDir = createTempDir();
+    const agentDir = createTempDir();
     process.env.HOME = home;
     writeFileSync(join(packageDir, "package.json"), JSON.stringify({ piConfig: { name: "arc", configDir: ".arc" } }));
     process.env.PI_PACKAGE_DIR = packageDir;
@@ -97,9 +91,9 @@ describe("Pi agent dir paths", () => {
   });
 
   it("keeps MCP_OAUTH_DIR as the explicit OAuth storage override", async () => {
-    const home = mkdtempSync(join(tmpdir(), "pi-mcp-agent-dir-home-"));
-    const agentDir = mkdtempSync(join(tmpdir(), "pi-mcp-agent-dir-"));
-    const oauthDir = mkdtempSync(join(tmpdir(), "pi-mcp-oauth-dir-"));
+    const home = createTempDir();
+    const agentDir = createTempDir();
+    const oauthDir = createTempDir();
     process.env.HOME = home;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.MCP_OAUTH_DIR = oauthDir;
