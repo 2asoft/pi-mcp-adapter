@@ -10,6 +10,7 @@
     "uninstall-local": "node ./scripts/uninstall-local.mjs"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.3",
     "@modelcontextprotocol/ext-apps": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "chart.js": "^4.5.1",
