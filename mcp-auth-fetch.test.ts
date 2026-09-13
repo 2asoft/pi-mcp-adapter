@@ -99,7 +99,7 @@ describe("origin-scoped OAuth fetch", () => {
           return true
         })
       }
-      assert.equal(resolveOAuthHeaders({ x: "!exit 1" }, false).has("x"), false)
+      assert.equal(resolveOAuthHeaders({ x: "!exit 1" }, { commands: false }).has("x"), false)
     } finally {
       delete process.env.MCP_TEST_SERVICE_HEADER
     }
@@ -109,6 +109,20 @@ describe("origin-scoped OAuth fetch", () => {
     const getHeaders = oauthHeaderResolver({ x: "!printf '!literal-${NOT_INTERPOLATED}'" })
     assert.equal(getHeaders(), getHeaders())
     assert.equal(getHeaders().get("x"), "!literal-${NOT_INTERPOLATED}")
+  })
+
+  it("preserves literal plugin headers in OAuth resolvers", () => {
+    process.env.MCP_TEST_SERVICE_HEADER = service
+    try {
+      const getHeaders = oauthHeaderResolver({
+        command: "!exit 1",
+        env: "${MCP_TEST_SERVICE_HEADER}",
+      }, { literal: true })
+      assert.equal(getHeaders().get("command"), "!exit 1")
+      assert.equal(getHeaders().get("env"), "${MCP_TEST_SERVICE_HEADER}")
+    } finally {
+      delete process.env.MCP_TEST_SERVICE_HEADER
+    }
   })
 
   it("memoizes failed command resolution until a separately owned resolver retries", (t) => {

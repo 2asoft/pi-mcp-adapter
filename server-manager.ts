@@ -41,6 +41,7 @@ import { resolveNpxBinary } from "./npx-resolver.ts";
 import { createJsonSchemaValidator } from "./json-schema-validator.ts";
 import { logger } from "./logger.ts";
 import { RESOURCE_MIME_TYPE } from "./ui-app-bridge-helpers.ts";
+import { isBuiltInAgentPlugin } from "./agent-plugin-provenance.ts";
 import { McpOAuthProvider } from "./mcp-oauth-provider.ts";
 import { extractOAuthConfig, supportsOAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import {
@@ -914,8 +915,11 @@ export class McpServerManager {
     if (definition.command) {
       client = this.createClient(name, definition);
       let command = definition.command;
-      let args = (definition.args ?? []).map((argument) => interpolateEnvVars(argument));
-      const cwd = resolveConfigPath(definition.cwd) ?? this.defaultCwd;
+      const literalArgs = isBuiltInAgentPlugin(definition, "args");
+      const literalCwd = isBuiltInAgentPlugin(definition, "cwd");
+      let args = literalArgs ? [...(definition.args ?? [])] : (definition.args ?? []).map((argument) => interpolateEnvVars(argument));
+      const cwd = (literalCwd ? definition.cwd : resolveConfigPath(definition.cwd)) ?? this.defaultCwd;
+      if (definition.pluginDataDir) mkdirSync(definition.pluginDataDir, { recursive: true });
       if (cwd !== undefined) {
         const cwdStats = statSync(cwd, { throwIfNoEntry: false });
         if (!cwdStats) throw new Error(`MCP server "${name}" configured cwd does not exist: "${cwd}"`);
@@ -932,14 +936,13 @@ export class McpServerManager {
       }
       throwIfAborted(signal);
 
-      if (definition.pluginDataDir) mkdirSync(definition.pluginDataDir, { recursive: true });
       const stdioTransport = new StdioClientTransport({
         command,
         args,
         env: resolveEnv(
           definition.env,
           name,
-          definition.literalEnv === true,
+          isBuiltInAgentPlugin(definition, "env") || definition.literalEnv === true,
           definition.inheritEnv !== false,
         ),
         ...(cwd !== undefined ? { cwd } : {}),
@@ -1327,15 +1330,21 @@ export class McpServerManager {
 
     // Resolve secret commands only for this connection attempt, without
     // mutating the persisted configuration.
-    const hasCommandHeader = Object.values(definition.headers ?? {})
+    const literalHeaders = isBuiltInAgentPlugin(definition, "headers");
+    const hasCommandHeader = !literalHeaders && Object.values(definition.headers ?? {})
       .some(value => value.startsWith("!") && !value.startsWith("!!"));
     const oauthEnabled = supportsOAuth(definition);
-    const headers = oauthEnabled
-      ? Object.fromEntries(resolveOAuthHeaders(definition.headers))
-      : resolveCommandSecretsRecord(
+    let headers: Record<string, string>;
+    if (literalHeaders) {
+      headers = { ...definition.headers };
+    } else if (oauthEnabled) {
+      headers = Object.fromEntries(resolveOAuthHeaders(definition.headers));
+    } else {
+      headers = resolveCommandSecretsRecord(
         definition.headers,
         key => `MCP server "${serverName}" HTTP header "${key}"`,
       ) ?? {};
+    }
 
     // Resolve bearer auth before creating requestInit so every attempted
     // transport receives the same headers.

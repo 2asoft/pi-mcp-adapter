@@ -3,8 +3,10 @@ import { existsSync, readFileSync, realpathSync, statSync, writeFileSync, mkdirS
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseToml } from "smol-toml";
+import stripJsonComments from "strip-json-comments";
 import { getAgentPath, getConfigDirName } from "./agent-dir.js";
 import { getAgentPluginSummaries, loadAgentPluginConfigs } from "./agent-plugin-loader.js";
+import { cloneBuiltInAgentPluginEntry, isBuiltInAgentPlugin, mergeBuiltInAgentPluginEntries } from "./agent-plugin-provenance.js";
 import { loadClaudePluginBundles } from "./claude-plugin-loader.js";
 import { loadPackageMcpConfigs } from "./package-mcp-loader.js";
 import { formatServerNamespace, isServerDisabled } from "./types.js";
@@ -198,7 +200,13 @@ export function getMcpDiscoverySummary(overridePath, cwd = process.cwd(), option
     };
 }
 export function cloneMcpConfig(config) {
-    return structuredClone(config);
+    const cloned = structuredClone(config);
+    for (const [name, source] of Object.entries(config.mcpServers)) {
+        const builtInClone = cloneBuiltInAgentPluginEntry(source);
+        if (builtInClone)
+            cloned.mcpServers[name] = builtInClone;
+    }
+    return cloned;
 }
 export function loadMcpConfig(overridePath, cwd = process.cwd()) {
     const sourceSpecs = getConfigSources(overridePath, cwd);
@@ -562,7 +570,12 @@ function mergeServerMaps(base, next) {
                 delete baseEntry.oauth;
             }
         }
-        merged[name] = { ...baseEntry, ...definition };
+        if (existing && Object.hasOwn(definition, "env") && isBuiltInAgentPlugin(existing, "env") && !Object.hasOwn(definition, "literalEnv")) {
+            if (baseEntry === existing)
+                baseEntry = { ...existing };
+            delete baseEntry.literalEnv;
+        }
+        merged[name] = mergeBuiltInAgentPluginEntries(baseEntry, definition);
     }
     return merged;
 }
@@ -666,7 +679,10 @@ function readValidatedConfig(path, label) {
     if (!existsSync(path))
         return null;
     try {
-        return validateConfig(parseJsonWithComments(readFileSync(path, "utf-8")));
+        const text = readFileSync(path, "utf-8");
+        if (stripJsonComments(text, { trailingCommas: true }).trim() === "")
+            return null;
+        return validateConfig(parseJsonWithComments(text));
     }
     catch (error) {
         console.warn(`Failed to load ${label}:`, error);

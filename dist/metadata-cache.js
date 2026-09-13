@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "
 import { dirname } from "node:path";
 import { getAgentPath } from "./agent-dir.js";
 import { createHash } from "node:crypto";
+import { isBuiltInAgentPlugin } from "./agent-plugin-provenance.js";
 import { getToolUiResourceUri } from "./ui-app-bridge-helpers.js";
 import { createToolSelectorCandidateIndex, formatPromptCommandName, formatToolName, getToolNameCandidates, isServerDisabled, isToolAllowed, resolveToolPrefix } from "./types.js";
 import { resourceNameToToolName } from "./resource-tools.js";
@@ -61,10 +62,10 @@ export function computeServerHash(definition, environment = process.env) {
         command: definition.command,
         args: definition.args,
         socket: resolveConfigPath(definition.socket, environment),
-        env: interpolateEnvRecord(definition.env, environment),
-        cwd: resolveConfigPath(definition.cwd, environment),
+        env: isBuiltInAgentPlugin(definition, "env") ? definition.env : interpolateEnvRecord(definition.env, environment),
+        cwd: isBuiltInAgentPlugin(definition, "cwd") ? definition.cwd : resolveConfigPath(definition.cwd, environment),
         url: resolveServerUrl(definition, environment),
-        headers: interpolateEnvRecord(definition.headers, environment),
+        headers: isBuiltInAgentPlugin(definition, "headers") ? definition.headers : interpolateEnvRecord(definition.headers, environment),
         requestHeadersCommand: definition.requestHeadersCommand
             ? {
                 command: interpolateEnvVars(definition.requestHeadersCommand.command, environment),

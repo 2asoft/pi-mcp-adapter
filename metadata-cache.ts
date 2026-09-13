@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "
 import { dirname } from "node:path";
 import { getAgentPath } from "./agent-dir.ts";
 import { createHash } from "node:crypto";
+import { isBuiltInAgentPlugin } from "./agent-plugin-provenance.ts";
 import { getToolUiResourceUri } from "./ui-app-bridge-helpers.ts";
 import type {
   CachedPrompt,
@@ -88,10 +89,10 @@ export function computeServerHash(definition: ServerEntry, environment: NodeJS.P
     command: definition.command,
     args: definition.args,
     socket: resolveConfigPath(definition.socket, environment),
-    env: interpolateEnvRecord(definition.env, environment),
-    cwd: resolveConfigPath(definition.cwd, environment),
+    env: isBuiltInAgentPlugin(definition, "env") ? definition.env : interpolateEnvRecord(definition.env, environment),
+    cwd: isBuiltInAgentPlugin(definition, "cwd") ? definition.cwd : resolveConfigPath(definition.cwd, environment),
     url: resolveServerUrl(definition, environment),
-    headers: interpolateEnvRecord(definition.headers, environment),
+    headers: isBuiltInAgentPlugin(definition, "headers") ? definition.headers : interpolateEnvRecord(definition.headers, environment),
     requestHeadersCommand: definition.requestHeadersCommand
       ? {
           command: interpolateEnvVars(definition.requestHeadersCommand.command, environment),

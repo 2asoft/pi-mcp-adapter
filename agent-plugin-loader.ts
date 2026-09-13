@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { getAgentPath } from "./agent-dir.ts";
+import { markBuiltInAgentPlugin } from "./agent-plugin-provenance.ts";
 import type { McpConfig, ServerEntry } from "./types.ts";
 
 const PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
@@ -21,6 +22,8 @@ const PLUGIN_MANIFEST_FIELDS = new Set([
 const MCP_CONFIG_FIELDS = new Set(["$schema", "mcpServers"]);
 const STDIO_FIELDS = new Set(["type", "command", "args", "env", "cwd"]);
 const HTTP_FIELDS = new Set(["type", "url", "headers"]);
+const STRING_MANIFEST_FIELDS = ["version", "description", "homepage", "repository", "license"] as const;
+const AUTHOR_FIELDS = new Set(["name", "email", "url"]);
 
 interface AgentPluginManifest {
   name: string;
@@ -50,7 +53,7 @@ export function loadAgentPluginConfigs(paths: unknown, cwd = process.cwd()): Mcp
 
 export function getAgentPluginSummaries(paths: unknown, cwd = process.cwd()): AgentPluginSummary[] {
   return getPluginPaths(paths).map(path => {
-    const pluginRoot = resolvePluginPath(path, cwd);
+    const pluginRoot = resolvePluginRoot(path, cwd);
     const loaded = loadAgentPluginMcpConfig(path, cwd);
     const manifest = loaded ? readPluginManifest(pluginRoot, false) : null;
     return {
@@ -66,7 +69,7 @@ function getPluginPaths(paths: unknown): string[] {
 }
 
 function loadAgentPluginMcpConfig(path: string, cwd: string): McpConfig | null {
-  const pluginRoot = resolvePluginPath(path, cwd);
+  const pluginRoot = resolvePluginRoot(path, cwd);
   const manifest = readPluginManifest(pluginRoot, true);
   if (!manifest) return null;
 
@@ -76,10 +79,15 @@ function loadAgentPluginMcpConfig(path: string, cwd: string): McpConfig | null {
     console.warn(`Agent Plugin ${manifest.name} has invalid MCP config: mcp.json is not a regular file`);
     return { mcpServers: {} };
   }
+  const resolvedMcpPath = resolveRealContainedPath(pluginRoot, mcpPath);
+  if (!resolvedMcpPath) {
+    console.warn(`Agent Plugin ${manifest.name} has invalid MCP config: mcp.json must stay inside the plugin directory`);
+    return { mcpServers: {} };
+  }
 
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(mcpPath, "utf8"));
+    raw = JSON.parse(readFileSync(resolvedMcpPath, "utf8"));
   } catch (error) {
     console.warn(`Agent Plugin ${manifest.name} has invalid MCP config: failed to parse mcp.json`, error);
     return { mcpServers: {} };
@@ -98,10 +106,15 @@ function readPluginManifest(pluginRoot: string, report: boolean): AgentPluginMan
     if (report) console.warn(`Agent Plugin at ${pluginRoot} is invalid: plugin.json is not a regular file`);
     return null;
   }
+  const resolvedManifestPath = resolveRealContainedPath(pluginRoot, manifestPath);
+  if (!resolvedManifestPath) {
+    if (report) console.warn(`Agent Plugin at ${pluginRoot} is invalid: plugin.json must stay inside the plugin directory`);
+    return null;
+  }
 
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(manifestPath, "utf8"));
+    raw = JSON.parse(readFileSync(resolvedManifestPath, "utf8"));
   } catch (error) {
     if (report) console.warn(`Agent Plugin at ${pluginRoot} is invalid: failed to parse plugin.json`, error);
     return null;
@@ -123,6 +136,20 @@ function readPluginManifest(pluginRoot: string, report: boolean): AgentPluginMan
   }
   if (typeof manifest.name !== "string" || manifest.name.length < 1 || manifest.name.length > 64 || !PLUGIN_NAME_PATTERN.test(manifest.name)) {
     if (report) console.warn(`Agent Plugin at ${pluginRoot} is invalid: plugin.json name is invalid`);
+    return null;
+  }
+  for (const field of STRING_MANIFEST_FIELDS) {
+    if (manifest[field] !== undefined && typeof manifest[field] !== "string") {
+      if (report) console.warn(`Agent Plugin ${manifest.name} is invalid: plugin.json ${field} must be a string`);
+      return null;
+    }
+  }
+  if (manifest.keywords !== undefined && (!Array.isArray(manifest.keywords) || manifest.keywords.some(value => typeof value !== "string"))) {
+    if (report) console.warn(`Agent Plugin ${manifest.name} is invalid: plugin.json keywords must be an array of strings`);
+    return null;
+  }
+  if (manifest.author !== undefined && !isValidManifestAuthor(manifest.author)) {
+    if (report) console.warn(`Agent Plugin ${manifest.name} is invalid: plugin.json author is invalid`);
     return null;
   }
   if (manifest.extensions !== undefined && (!manifest.extensions || typeof manifest.extensions !== "object" || Array.isArray(manifest.extensions))) {
@@ -205,14 +232,14 @@ function translateStdioServer(
   const env = translateEnv(raw.env, manifest, serverName);
   if (env === null) return null;
 
-  const command = raw.command.startsWith("./") ? resolveContainedPath(pluginRoot, raw.command, pluginRoot) : raw.command;
-  if (command === null) return skipServer(manifest, serverName, "command must stay inside the plugin directory");
+  const command = raw.command.startsWith("./") ? resolveRealContainedPath(pluginRoot, resolve(pluginRoot, raw.command)) : raw.command;
+  if (command === null) return skipServer(manifest, serverName, "command must resolve to an accessible path inside the plugin directory");
 
   const pluginDataDir = getAgentPath("agent-plugin-data", manifest.name);
   const cwd = resolvePluginCwd(raw.cwd, pluginRoot, pluginDataDir);
-  if (cwd === null) return skipServer(manifest, serverName, "cwd must be plugin-relative, PLUGIN_ROOT-rooted, or PLUGIN_DATA-rooted");
+  if (cwd === null) return skipServer(manifest, serverName, "cwd must resolve from an allowed root and stay contained");
 
-  return {
+  return markBuiltInAgentPlugin({
     command,
     args: args.map(value => expandPluginPlaceholders(value, pluginRoot, pluginDataDir)),
     env: {
@@ -223,7 +250,7 @@ function translateStdioServer(
     cwd,
     pluginDataDir,
     literalEnv: true,
-  };
+  }, ["args", "env", "cwd"]);
 }
 
 function translateHttpServer(
@@ -240,11 +267,11 @@ function translateHttpServer(
   const headers = translateHeaders(raw.headers, manifest, serverName);
   if (headers === null) return null;
 
-  return {
+  return markBuiltInAgentPlugin({
     url: raw.url,
     httpTransport: type,
     ...(headers ? { headers } : {}),
-  };
+  }, headers ? ["headers"] : []);
 }
 
 function formatAgentPluginServerName(pluginName: string, serverName: string): string {
@@ -273,7 +300,7 @@ function translateEnv(value: unknown, manifest: AgentPluginManifest, serverName:
     console.warn(`Agent Plugin ${manifest.name} skips invalid MCP server ${serverName}: env must be an object of strings`);
     return null;
   }
-  const env: Record<string, string> = {};
+  const entries: Array<[string, string]> = [];
   for (const [key, entry] of Object.entries(value)) {
     if (key === "PLUGIN_ROOT" || key === "PLUGIN_DATA") {
       console.warn(`Agent Plugin ${manifest.name} skips invalid MCP server ${serverName}: env must not define ${key}`);
@@ -283,9 +310,9 @@ function translateEnv(value: unknown, manifest: AgentPluginManifest, serverName:
       console.warn(`Agent Plugin ${manifest.name} skips invalid MCP server ${serverName}: env values must be strings`);
       return null;
     }
-    env[key] = entry;
+    entries.push([key, entry]);
   }
-  return env;
+  return Object.fromEntries(entries);
 }
 
 function translateHeaders(value: unknown, manifest: AgentPluginManifest, serverName: string): Record<string, string> | undefined | null {
@@ -294,7 +321,7 @@ function translateHeaders(value: unknown, manifest: AgentPluginManifest, serverN
     console.warn(`Agent Plugin ${manifest.name} skips invalid MCP server ${serverName}: headers must be an object of strings`);
     return null;
   }
-  const headers: Record<string, string> = {};
+  const entries: Array<[string, string]> = [];
   const seen = new Set<string>();
   for (const [key, entry] of Object.entries(value)) {
     if (typeof entry !== "string") {
@@ -307,8 +334,9 @@ function translateHeaders(value: unknown, manifest: AgentPluginManifest, serverN
       return null;
     }
     seen.add(normalized);
-    headers[key] = entry;
+    entries.push([key, entry]);
   }
+  const headers = Object.fromEntries(entries);
   try {
     new Headers(headers);
   } catch {
@@ -324,6 +352,20 @@ function resolvePluginPath(path: string, cwd: string): string {
   return isAbsolute(path) ? resolve(path) : resolve(cwd, path);
 }
 
+function resolvePluginRoot(path: string, cwd: string): string {
+  const resolved = resolvePluginPath(path, cwd);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function isValidManifestAuthor(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.entries(value).every(([key, entry]) => AUTHOR_FIELDS.has(key) && typeof entry === "string");
+}
+
 function isBareCommand(command: string): boolean {
   return !command.includes("/") && !command.includes("\\") && !command.includes("${PLUGIN_ROOT}") && !command.includes("${PLUGIN_DATA}");
 }
@@ -331,27 +373,59 @@ function isBareCommand(command: string): boolean {
 function resolvePluginCwd(value: unknown, pluginRoot: string, pluginDataDir: string): string | null {
   if (value === undefined) return pluginRoot;
   if (typeof value !== "string") return null;
-  if (value.startsWith("./")) return resolveContainedPath(pluginRoot, value, pluginRoot);
-  if (value === "${PLUGIN_ROOT}" || value.startsWith("${PLUGIN_ROOT}/")) {
-    return resolveContainedPath(pluginRoot, value.replace("${PLUGIN_ROOT}", "."), pluginRoot);
+  const expanded = expandPluginPlaceholders(value, pluginRoot, pluginDataDir);
+  if (value.startsWith("./") || value === "${PLUGIN_ROOT}" || value.startsWith("${PLUGIN_ROOT}/")) {
+    return resolveRealContainedPath(pluginRoot, resolve(pluginRoot, expanded));
   }
-  if (value === "${PLUGIN_DATA}" || value.startsWith("${PLUGIN_DATA}/")) {
-    return resolveContainedPath(pluginDataDir, value.replace("${PLUGIN_DATA}", "."), pluginDataDir);
-  }
+  if (value === "${PLUGIN_DATA}" || value.startsWith("${PLUGIN_DATA}/")) return resolvePluginDataCwd(pluginDataDir, expanded);
   return null;
 }
 
-function resolveContainedPath(root: string, value: string, containmentRoot: string): string | null {
+function resolvePluginDataCwd(pluginDataDir: string, expanded: string): string | null {
+  const candidate = resolve(pluginDataDir, expanded);
+  if (!resolveContainedPath(pluginDataDir, candidate)) return null;
+
+  try {
+    const dataRoot = dirname(pluginDataDir);
+    if (!existsSync(dataRoot)) return candidate;
+    const realDataRoot = realpathSync(dataRoot);
+    if (!existsSync(pluginDataDir)) return candidate;
+    const realPluginDataDir = realpathSync(pluginDataDir);
+    if (!resolveContainedPath(realDataRoot, realPluginDataDir)) return null;
+
+    let existing = candidate;
+    while (!existsSync(existing)) {
+      const parent = dirname(existing);
+      if (parent === existing) return null;
+      existing = parent;
+    }
+    const realExisting = realpathSync(existing);
+    if (!resolveContainedPath(realPluginDataDir, realExisting)) return null;
+    return existing === candidate ? realExisting : candidate;
+  } catch {
+    return null;
+  }
+}
+
+function resolveRealContainedPath(root: string, path: string): string | null {
+  try {
+    const realRoot = realpathSync(root);
+    const realPath = realpathSync(path);
+    return resolveContainedPath(realRoot, realPath);
+  } catch {
+    return null;
+  }
+}
+
+function resolveContainedPath(root: string, value: string): string | null {
   const resolved = resolve(root, value);
-  const rel = relative(containmentRoot, resolved);
+  const rel = relative(root, resolved);
   if (rel === "" || (!rel.startsWith("..") && !rel.startsWith(sep) && !isAbsolute(rel))) return resolved;
   return null;
 }
 
 function expandPluginPlaceholders(value: string, pluginRoot: string, pluginDataDir: string): string {
-  return value
-    .replaceAll("${PLUGIN_ROOT}", pluginRoot)
-    .replaceAll("${PLUGIN_DATA}", pluginDataDir);
+  return value.replace(/\$\{PLUGIN_(ROOT|DATA)\}/g, (_, name: string) => name === "ROOT" ? pluginRoot : pluginDataDir);
 }
 
 function isValidAgentPluginUrl(value: string): boolean {
