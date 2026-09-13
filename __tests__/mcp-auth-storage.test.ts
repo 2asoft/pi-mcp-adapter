@@ -12,8 +12,10 @@ import {
   inspectAuthForUrl,
   OAuthCredentialStoreError,
   removeTestAuthSecretStoreEntry,
+  resetAuthEntryCache,
   resetTestAuthSecretStore,
   saveAuthEntry,
+  setTestAuthSecretStoreEntry,
 } from "../mcp-auth.ts";
 
 /**
@@ -21,6 +23,20 @@ import {
  * (2560 bytes) as UTF-16, so a single value cannot exceed 1280 characters.
  */
 const AUTH_SECRET_VALUE_LIMIT = 1280;
+const AUTH_SECRET_CHUNK_SIZE = 1000;
+const SERVER_URL = "https://example.com/mcp";
+
+function accessTokenForSerializedLength(length: number): string {
+  const envelopeLength = JSON.stringify({ tokens: { accessToken: "" }, serverUrl: SERVER_URL }).length;
+  return "x".repeat(length - envelopeLength);
+}
+
+function accessTokenWithAstralCharacterAcrossNominalBoundary(): string {
+  const marker = "TOKEN_MARKER";
+  const serialized = JSON.stringify({ tokens: { accessToken: marker }, serverUrl: SERVER_URL });
+  const tokenStart = serialized.indexOf(marker);
+  return `${"x".repeat(AUTH_SECRET_CHUNK_SIZE - tokenStart - 1)}😀${"y".repeat(100)}`;
+}
 
 describe("OAuth credential-store diagnostics", () => {
   it("recognizes a revoked Linux keyring through the error cause chain", () => {
@@ -149,20 +165,66 @@ describe("mcp-auth storage paths", () => {
     rmSync(project, { recursive: true, force: true });
   });
 
-  it("chunks large secure-store entries and reads them back", () => {
-    const accessToken = "x".repeat(5000);
-    saveAuthEntry("large-entry", { tokens: { accessToken } }, "https://example.com/mcp");
+  it("stores an ordinary 9 KiB payload as one native item outside Windows", () => {
+    const accessToken = accessTokenForSerializedLength(9 * 1024);
+    saveAuthEntry("large-entry", { tokens: { accessToken } }, SERVER_URL);
 
     expect(getAuthEntry("large-entry")?.tokens?.accessToken).toBe(accessToken);
     const entries = getTestAuthSecretStoreEntries();
-    const manifestEntry = entries.find(([account]) => !account.includes(".chunk."));
-    const chunkEntries = entries.filter(([account]) => account.includes(".chunk."));
+    if (process.platform === "win32") {
+      const manifestEntry = entries.find(([account]) => !account.includes(".chunk."));
+      const chunkEntries = entries.filter(([account]) => account.includes(".chunk."));
+      expect(manifestEntry).toBeDefined();
+      const manifest = JSON.parse(manifestEntry![1]) as { __piMcpAdapterOAuthChunked?: number; chunkCount?: number };
+      expect(manifest.__piMcpAdapterOAuthChunked).toBe(1);
+      expect(chunkEntries).toHaveLength(manifest.chunkCount!);
+      expect(chunkEntries.every(([, payload]) => payload.length <= AUTH_SECRET_VALUE_LIMIT)).toBe(true);
+    } else {
+      expect(entries).toHaveLength(1);
+      expect(entries[0][0]).not.toContain(".chunk.");
+      expect(JSON.parse(entries[0][1]).__piMcpAdapterOAuthChunked).toBeUndefined();
+    }
+  });
 
-    expect(manifestEntry).toBeDefined();
-    const manifest = JSON.parse(manifestEntry![1]) as { __piMcpAdapterOAuthChunked?: number; chunkCount?: number };
-    expect(manifest.__piMcpAdapterOAuthChunked).toBe(1);
-    expect(chunkEntries).toHaveLength(manifest.chunkCount);
-    expect(chunkEntries.every(([, payload]) => payload.length <= AUTH_SECRET_VALUE_LIMIT)).toBe(true);
+  it("uses the serialized 1000-character boundary for the size-limited store", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
+
+    for (const [serverName, payloadLength, chunked] of [
+      ["size-limited-at-boundary", AUTH_SECRET_CHUNK_SIZE, false],
+      ["size-limited-over-boundary", AUTH_SECRET_CHUNK_SIZE + 1, true],
+    ] as const) {
+      resetTestAuthSecretStore();
+      const accessToken = accessTokenForSerializedLength(payloadLength);
+      saveAuthEntry(serverName, { tokens: { accessToken } }, SERVER_URL);
+
+      expect(getAuthEntry(serverName)?.tokens?.accessToken).toBe(accessToken);
+      const entries = getTestAuthSecretStoreEntries();
+      expect(entries.every(([, payload]) => payload.length <= AUTH_SECRET_VALUE_LIMIT)).toBe(true);
+      expect(entries.some(([account]) => account.includes(".chunk."))).toBe(chunked);
+      const primary = entries.find(([account]) => !account.includes(".chunk."));
+      expect(primary).toBeDefined();
+      expect(JSON.parse(primary![1]).__piMcpAdapterOAuthChunked === 1).toBe(chunked);
+    }
+  });
+
+  it("keeps surrogate pairs intact across native-string chunk round trips", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
+    const accessToken = accessTokenWithAstralCharacterAcrossNominalBoundary();
+    const serialized = JSON.stringify({ tokens: { accessToken }, serverUrl: SERVER_URL });
+    expect([serialized.charCodeAt(999), serialized.charCodeAt(1000)]).toEqual([0xd83d, 0xde00]);
+    saveAuthEntry("unicode-boundary", { tokens: { accessToken } }, SERVER_URL);
+
+    const chunkEntries = getTestAuthSecretStoreEntries().filter(([account]) => account.includes(".chunk."));
+    expect(chunkEntries.length).toBeGreaterThan(1);
+    expect(chunkEntries.every(([, payload]) => payload.length <= AUTH_SECRET_CHUNK_SIZE)).toBe(true);
+    for (const [account, payload] of chunkEntries) {
+      const nativeRoundTrip = Buffer.from(payload, "utf8").toString("utf8");
+      expect(nativeRoundTrip).not.toContain("�");
+      setTestAuthSecretStoreEntry(account, nativeRoundTrip);
+    }
+
+    resetAuthEntryCache();
+    expect(getAuthEntry("unicode-boundary")?.tokens?.accessToken).toBe(accessToken);
   });
 
   it("persists records that exceed the strictest per-value store limit", () => {
@@ -209,6 +271,7 @@ describe("mcp-auth storage paths", () => {
   });
 
   it("returns unavailable status when a stored chunk cannot be read", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
     saveAuthEntry("large-status", { tokens: { accessToken: "x".repeat(5000) } }, "https://example.com/mcp");
     const chunkAccount = getTestAuthSecretStoreEntries().find(([account]) => account.includes(".chunk."))?.[0];
     expect(chunkAccount).toBeDefined();
@@ -217,7 +280,24 @@ describe("mcp-auth storage paths", () => {
     expect(inspectAuthForUrl("large-status", "https://example.com/mcp").status).toBe("unavailable");
   });
 
+  it("rejects schema-valid chunk corruption without compacting or deleting it", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
+    saveAuthEntry("corrupt-chunk", { tokens: { accessToken: "x".repeat(5000) } }, SERVER_URL);
+    const [chunkAccount, chunkPayload] = getTestAuthSecretStoreEntries()
+      .find(([account, payload]) => account.includes(".chunk.") && payload.includes("x"))!;
+    setTestAuthSecretStoreEntry(chunkAccount, chunkPayload.replace("x", "y"));
+    const corruptedEntries = getTestAuthSecretStoreEntries();
+
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    resetAuthEntryCache();
+    expect(inspectAuthForUrl("corrupt-chunk", SERVER_URL).status).toBe("unavailable");
+    expect(getTestAuthSecretStoreEntries()).toEqual(corruptedEntries);
+    expect(() => getAuthEntry("corrupt-chunk")).toThrow(/read OAuth credentials/);
+    expect(getTestAuthSecretStoreEntries()).toEqual(corruptedEntries);
+  });
+
   it("removes chunk payloads when credentials are cleared", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
     saveAuthEntry("large-remove", { tokens: { accessToken: "x".repeat(5000) } }, "https://example.com/mcp");
     const storedAccounts = getTestAuthSecretStoreEntries().map(([account]) => account);
     expect(storedAccounts.some(account => account.includes(".chunk."))).toBe(true);
@@ -229,6 +309,7 @@ describe("mcp-auth storage paths", () => {
   });
 
   it("cleans stale chunks when a large entry is replaced by a small one", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
     saveAuthEntry("large-to-small", { tokens: { accessToken: "x".repeat(5000) } }, "https://example.com/mcp");
     expect(getTestAuthSecretStoreEntries().some(([account]) => account.includes(".chunk."))).toBe(true);
 
@@ -238,6 +319,54 @@ describe("mcp-auth storage paths", () => {
     const entries = getTestAuthSecretStoreEntries();
     expect(entries).toHaveLength(1);
     expect(entries[0][0]).not.toContain(".chunk.");
+  });
+
+  it("does not compact chunked records during status-only inspection", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
+    const accessToken = "x".repeat(5000);
+    saveAuthEntry("status-chunks", { tokens: { accessToken } }, "https://example.com/mcp");
+    const before = getTestAuthSecretStoreEntries().length;
+    expect(before).toBeGreaterThan(1);
+
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    resetAuthEntryCache();
+    expect(inspectAuthForUrl("status-chunks", "https://example.com/mcp").status).toBe("present");
+    expect(getTestAuthSecretStoreEntries().some(([account]) => account.includes(".chunk."))).toBe(true);
+    expect(getTestAuthSecretStoreEntries()).toHaveLength(before);
+
+    expect(getAuthEntry("status-chunks")?.tokens?.accessToken).toBe(accessToken);
+    const compacted = getTestAuthSecretStoreEntries();
+    expect(compacted).toHaveLength(1);
+    expect(compacted[0][0]).not.toContain(".chunk.");
+  });
+
+  it("preserves readable chunks and reports a failed primary compaction write", () => {
+    if (process.platform === "win32") return;
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
+    const accessToken = "x".repeat(5000);
+    saveAuthEntry("failed-compaction", { tokens: { accessToken } }, SERVER_URL);
+    const before = getTestAuthSecretStoreEntries();
+
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "writefailing";
+    resetAuthEntryCache();
+    expect(() => getAuthEntry("failed-compaction")).toThrow(/write OAuth credentials/);
+    expect(getTestAuthSecretStoreEntries()).toEqual(before);
+    expect(inspectAuthForUrl("failed-compaction", SERVER_URL).status).toBe("present");
+  });
+
+  it("commits the primary item before best-effort old-chunk cleanup", () => {
+    if (process.platform === "win32") return;
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "sizelimited";
+    const accessToken = "x".repeat(5000);
+    saveAuthEntry("cleanup-failure", { tokens: { accessToken } }, SERVER_URL);
+
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "removefailing";
+    resetAuthEntryCache();
+    expect(getAuthEntry("cleanup-failure")?.tokens?.accessToken).toBe(accessToken);
+    const entries = getTestAuthSecretStoreEntries();
+    const primary = entries.find(([account]) => !account.includes(".chunk."));
+    expect(JSON.parse(primary![1]).tokens.accessToken).toBe(accessToken);
+    expect(entries.some(([account]) => account.includes(".chunk."))).toBe(true);
   });
 
   it("routes revoked Linux keyring operations through the recovery helper", () => {
