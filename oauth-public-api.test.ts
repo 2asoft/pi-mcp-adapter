@@ -16,7 +16,6 @@ const {
   getAuthForUrl,
   resetTestAuthSecretStore,
   saveAuthEntry,
-  withAuthEntryTransaction,
 } = await import("./mcp-auth.ts");
 
 describe("public OAuth token API", () => {
@@ -57,6 +56,24 @@ describe("public OAuth token API", () => {
     assert.deepStrictEqual(inspectMcpOAuthTokensForUrl("jira", "https://other.example.com/mcp"), {
       status: "absent",
     });
+  });
+
+  it("uses one token snapshot for expiry and return decisions", async () => {
+    const serverUrl = "https://jira.example.com/mcp";
+    await updateMcpOAuthTokensForUrl("jira", serverUrl, {
+      accessToken: "expired-access",
+      refreshToken: "refresh-1",
+      expiresAt: Date.now() / 1000 - 60,
+    });
+
+    const pending = getMcpOAuthTokensForUrl("jira", serverUrl);
+    await updateMcpOAuthTokensForUrl("jira", serverUrl, {
+      accessToken: "current-access",
+      expiresAt: Date.now() / 1000 + 3600,
+    });
+
+    assert.strictEqual(await pending, undefined);
+    assert.strictEqual((await getMcpOAuthTokensForUrl("jira", serverUrl))?.accessToken, "current-access");
   });
 
   it("does not expose client info or OAuth flow secrets", () => {
@@ -105,6 +122,16 @@ describe("public OAuth token API", () => {
         () => getMcpOAuthTokensForUrl("jira", "https://jira.example.com/mcp"),
         /Failed to read OAuth credentials.*OS secure credential store/,
       );
+      let updatePromise!: Promise<void>;
+      assert.doesNotThrow(() => {
+        updatePromise = updateMcpOAuthTokensForUrl(
+          "jira",
+          "https://jira.example.com/mcp",
+          { accessToken: "access-1" },
+        );
+      });
+      assert(updatePromise instanceof Promise);
+      await assert.rejects(updatePromise, /Failed to read OAuth credentials.*OS secure credential store/);
       const status = inspectMcpOAuthTokensForUrl("jira", "https://jira.example.com/mcp");
       assert.strictEqual(status.status, "unavailable");
     } finally {
@@ -136,33 +163,5 @@ describe("public OAuth token API", () => {
     assert.strictEqual(privateEntry?.clientInfo, undefined);
     assert.strictEqual(privateEntry?.codeVerifier, undefined);
     assert.strictEqual(privateEntry?.oauthState, undefined);
-  });
-
-  it("serializes public token updates with credential transactions", async () => {
-    let releaseOwner!: () => void;
-    let ownerStarted!: () => void;
-    const gate = new Promise<void>((resolve) => { releaseOwner = resolve; });
-    const started = new Promise<void>((resolve) => { ownerStarted = resolve; });
-    const owner = withAuthEntryTransaction("jira", async () => {
-      ownerStarted();
-      await gate;
-    });
-    await started;
-
-    let updated = false;
-    const update = updateMcpOAuthTokensForUrl(
-      "jira",
-      "https://jira.example.com/mcp",
-      { accessToken: "serialized" },
-    ).then(() => { updated = true; });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.strictEqual(updated, false);
-
-    releaseOwner();
-    await Promise.all([owner, update]);
-    assert.deepStrictEqual(inspectMcpOAuthTokensForUrl("jira", "https://jira.example.com/mcp"), {
-      status: "present",
-      tokens: { accessToken: "serialized" },
-    });
   });
 });

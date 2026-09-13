@@ -11,7 +11,6 @@
  */
 
 import { spawnSync } from 'child_process';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
 import { readFileSync, existsSync, rmSync } from 'fs';
@@ -19,7 +18,6 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { getAgentPath } from './agent-dir.ts';
 import { resolveConfiguredOAuthDir } from './config.ts';
-import { sharedRefreshLockRoot, withRefreshLock } from './mcp-refresh-lock.ts';
 
 const require = createRequire(import.meta.url);
 const AUTH_SECRET_SERVICE = 'pi-mcp-adapter.oauth';
@@ -42,6 +40,57 @@ const TEST_LINUX_KEYRING_RECOVERY_ENV = 'PI_MCP_ADAPTER_TEST_LINUX_KEYRING_RECOV
 const AUTH_CACHE_DISABLED_ENV = 'PI_MCP_ADAPTER_DISABLE_AUTH_CACHE';
 const KEYRING_RECOVERY_TIMEOUT_MS = 10_000;
 const AUTH_CHUNK_MANIFEST_KEY = '__piMcpAdapterOAuthChunked';
+
+export type OAuthAuthority = () => void;
+
+type OAuthLifecycleRecord = {
+  generation: object;
+  revocations: number;
+  legacyImportBlocked: boolean;
+};
+
+const oauthLifecycleRecords = new Map<string, OAuthLifecycleRecord>();
+
+function getOAuthLifecycleRecord(serverName: string): OAuthLifecycleRecord {
+  let record = oauthLifecycleRecords.get(serverName);
+  if (!record) {
+    record = { generation: {}, revocations: 0, legacyImportBlocked: false };
+    oauthLifecycleRecords.set(serverName, record);
+  }
+  return record;
+}
+
+/** Capture immutable process-local authority for one server's OAuth lifecycle. */
+export function captureOAuthAuthority(serverName: string, assertNow = true): OAuthAuthority {
+  const record = getOAuthLifecycleRecord(serverName);
+  const generation = record.generation;
+  const capturedDuringRevocation = record.revocations > 0;
+  const assertAuthority = (): void => {
+    if (capturedDuringRevocation || record.generation !== generation || record.revocations > 0) {
+      throw new Error('OAuth flow is no longer active');
+    }
+  };
+  if (assertNow) assertAuthority();
+  return assertAuthority;
+}
+
+/** Begin an overlap-safe process-local logout interval. */
+export function beginOAuthRevocation(serverName: string): () => void {
+  const record = getOAuthLifecycleRecord(serverName);
+  record.generation = {};
+  record.revocations += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    record.revocations -= 1;
+  };
+}
+
+/** Prevent this process from importing unknown legacy plaintext after logout. */
+export function markOAuthLogoutComplete(serverName: string): void {
+  getOAuthLifecycleRecord(serverName).legacyImportBlocked = true;
+}
 
 /** OAuth token storage format */
 export interface StoredTokens {
@@ -728,10 +777,11 @@ function readAuthEntryFromStore(
     const entry = manifest
       ? readChunkedAuthEntry(store, serverName, account, manifest)
       : parseAuthEntryPayload(serverName, payload, 'OS secure credential store');
-    if (behavior.migrateLegacy !== false) removeLegacyAuthEntry(serverName, options);
+    removeLegacyAuthEntry(serverName, options);
     return entry;
   }
 
+  if (getOAuthLifecycleRecord(serverName).legacyImportBlocked) return undefined;
   const legacyEntry = readLegacyAuthEntry(serverName, options);
   if (!legacyEntry) return undefined;
   if (behavior.migrateLegacy === false) return legacyEntry;
@@ -743,11 +793,11 @@ function readAuthEntryFromStore(
 function readAuthEntry(
   serverName: string,
   options?: AuthStorageOptions,
-  behavior: { migrateLegacy?: boolean; cache?: boolean } = {},
+  behavior: { migrateLegacy?: boolean } = {},
 ): AuthEntry | undefined {
   // Status-only reads deliberately bypass the cache because they do not
   // migrate legacy entries.
-  const cacheable = (behavior.cache ?? behavior.migrateLegacy !== false) && isAuthEntryCacheEnabled();
+  const cacheable = behavior.migrateLegacy !== false && isAuthEntryCacheEnabled();
   if (cacheable && authEntryCache.has(serverName)) {
     return cloneAuthEntry(authEntryCache.get(serverName));
   }
@@ -767,16 +817,16 @@ function readAuthEntry(
 /**
  * Get auth entry for a server.
  */
-export function getAuthEntry(serverName: string, options?: AuthStorageOptions, behavior: { migrateLegacy?: boolean } = {}): AuthEntry | undefined {
-  return readAuthEntry(serverName, options, behavior);
+export function getAuthEntry(serverName: string, options?: AuthStorageOptions): AuthEntry | undefined {
+  return readAuthEntry(serverName, options);
 }
 
 /**
  * Get auth entry and validate it's for the correct URL.
  * Returns undefined if URL has changed (credentials are invalid).
  */
-export function getAuthForUrl(serverName: string, serverUrl: string, options?: AuthStorageOptions, behavior: { migrateLegacy?: boolean; cache?: boolean } = {}): AuthEntry | undefined {
-  const entry = readAuthEntry(serverName, options, behavior);
+export function getAuthForUrl(serverName: string, serverUrl: string, options?: AuthStorageOptions): AuthEntry | undefined {
+  const entry = getAuthEntry(serverName, options);
   if (!entry) return undefined;
 
   // If no serverUrl is stored, this is from an old version - consider it invalid
@@ -855,19 +905,6 @@ export function removeAuthEntry(serverName: string, options?: AuthStorageOptions
  */
 export function invalidateAuthEntryCache(serverName: string): void {
   authEntryCache.delete(serverName);
-}
-
-const authTransactions = new AsyncLocalStorage<{ signal: AbortSignal | undefined }>();
-
-export function currentAuthTransaction(): { signal: AbortSignal | undefined } | undefined {
-  return authTransactions.getStore();
-}
-
-export async function withAuthEntryTransaction<T>(serverName: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  return withRefreshLock(serverName, sharedRefreshLockRoot(), async () => {
-    invalidateAuthEntryCache(serverName);
-    return authTransactions.run({ signal }, operation);
-  }, signal);
 }
 
 /**

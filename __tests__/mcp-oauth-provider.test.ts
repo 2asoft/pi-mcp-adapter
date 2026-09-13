@@ -41,6 +41,7 @@ describe("McpOAuthProvider addClientAuthentication", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     rmSync(authDir, { recursive: true, force: true });
     if (originalOAuthDir === undefined) {
       delete process.env.MCP_OAUTH_DIR;
@@ -189,6 +190,7 @@ describe("McpOAuthProvider discovery state", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     rmSync(authDir, { recursive: true, force: true });
     if (originalOAuthDir === undefined) {
       delete process.env.MCP_OAUTH_DIR;
@@ -239,6 +241,36 @@ describe("McpOAuthProvider discovery state", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("rejects configured discovery that resumes after logout", async () => {
+    let release!: (response: Response) => void;
+    let markStarted!: () => void;
+    const response = new Promise<Response>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      markStarted();
+      return response;
+    }));
+    const metadataUrl = "https://auth.example.test/.well-known/openid-configuration";
+    const provider = new McpOAuthProvider(
+      "configured-discovery-logout",
+      serverUrl,
+      { authServerMetadataUrl: metadataUrl },
+      { onRedirect: async () => {} },
+    );
+    const pending = provider.discoveryState();
+    await started;
+    const { removeAuth } = await import("../mcp-auth-flow.ts");
+    await removeAuth("configured-discovery-logout");
+    release(new Response(JSON.stringify({
+      issuer: "https://auth.example.test",
+      authorization_endpoint: "https://auth.example.test/authorize",
+      token_endpoint: "https://auth.example.test/token",
+      response_types_supported: ["code"],
+    }), { headers: { "content-type": "application/json" } }));
+
+    await expect(pending).rejects.toThrow("OAuth flow is no longer active");
   });
 
   it("keeps configured issuer validation enabled unless explicitly skipped", async () => {
@@ -341,13 +373,6 @@ describe("McpOAuthProvider discovery state", () => {
     expect(await provider.tokens()).toMatchObject({
       access_token: "legacy-access",
       issuer: "https://auth.example.com",
-    });
-    expect(getAuthForUrl("legacy-binding", serverUrl)?.tokens?.issuer).toBeUndefined();
-    expect(getAuthForUrl("legacy-binding", serverUrl)?.clientInfo?.issuer).toBeUndefined();
-    await provider.withAuthTransaction(async () => {
-      await provider.clientInformation({ issuer: "https://auth.example.com" });
-      await provider.tokens({ issuer: "https://auth.example.com" });
-      return "AUTHORIZED";
     });
     expect(getAuthForUrl("legacy-binding", serverUrl)).toMatchObject({
       clientInfo: { issuer: "https://auth.example.com" },
@@ -465,11 +490,6 @@ describe("McpOAuthProvider discovery state", () => {
       client_id: "config-client",
       client_secret: "config-secret",
       issuer: "https://auth.example.com",
-    });
-    expect(getAuthForUrl("pre-registered-binding", serverUrl)?.clientInfo).toBeUndefined();
-    await provider.withAuthTransaction(async () => {
-      await provider.clientInformation({ issuer: "https://auth.example.com" });
-      return "AUTHORIZED";
     });
     expect(getAuthForUrl("pre-registered-binding", serverUrl)?.clientInfo).toEqual({
       clientId: "config-client",

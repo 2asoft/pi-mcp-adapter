@@ -43,8 +43,13 @@ import { logger } from "./logger.ts";
 import { RESOURCE_MIME_TYPE } from "./ui-app-bridge-helpers.ts";
 import { McpOAuthProvider } from "./mcp-oauth-provider.ts";
 import { extractOAuthConfig, supportsOAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
-import { createOAuthAwareFetch } from "./mcp-auth-fetch.ts";
-import { inspectAuthForUrl, invalidateAuthEntryCache, type AuthStorageOptions } from "./mcp-auth.ts";
+import {
+  captureOAuthAuthority,
+  inspectAuthForUrl,
+  invalidateAuthEntryCache,
+  type AuthStorageOptions,
+  type OAuthAuthority,
+} from "./mcp-auth.ts";
 import { getBearerTokenForUrl } from "./mcp-bearer-store.ts";
 import { registerSamplingHandler, type ServerSamplingConfig } from "./sampling-handler.ts";
 import {
@@ -225,6 +230,7 @@ export function isTransientHttpConnectError(error: unknown): boolean {
 export class McpServerManager {
   private connections = new Map<string, ServerConnection>();
   private connectPromises = new Map<string, Promise<ServerConnection>>();
+  private connectOAuthAuthorities = new Map<string, OAuthAuthority>();
   private reconnectPromises = new Map<string, Promise<ServerConnection>>();
   private uiStreamListeners = new Map<string, UiStreamListener>();
   private samplingConfig: ServerSamplingConfig | undefined;
@@ -242,6 +248,7 @@ export class McpServerManager {
   private elicitationConfig: ServerElicitationConfig | undefined;
   private authStorageOptions: AuthStorageOptions = {};
   private oauthRuntime: McpOAuthRuntime | undefined;
+  private oauthProviders = new Map<string, McpOAuthProvider>();
   private acceptedUrlElicitations = new Map<string, Set<string>>();
   private defaultRequestTimeoutMs: number | undefined;
   private runtimeSignal: AbortSignal | undefined;
@@ -310,6 +317,20 @@ export class McpServerManager {
     this.oauthRuntime = runtime;
   }
 
+  private setOAuthProvider(name: string, provider: McpOAuthProvider): void {
+    const previous = this.oauthProviders.get(name);
+    if (previous !== provider) previous?.deactivate();
+    this.oauthProviders.set(name, provider);
+  }
+
+  private deactivateOAuthProvider(name: string, authority?: OAuthAuthority): void {
+    const provider = this.oauthProviders.get(name);
+    if (!provider) return;
+    if (authority && !provider.hasAuthority(authority)) return;
+    this.oauthProviders.delete(name);
+    provider.deactivate();
+  }
+
   getRequestOptions(name: string, signal?: AbortSignal): RequestOptions | undefined {
     const connection = this.connections.get(name);
     return this.buildRequestOptions(connection?.definition, signal);
@@ -345,13 +366,34 @@ export class McpServerManager {
     if (this.stopped) throw new Error("MCP server manager is closed");
     const ownedSignal = combineAbortSignals(this.runtimeSignal, signal);
     throwIfAborted(ownedSignal);
+    const oauthAuthority = definition.url && supportsOAuth(definition)
+      ? captureOAuthAuthority(name, false)
+      : undefined;
     const closing = this.closePromises.get(name);
     if (closing) await abortable(closing, ownedSignal);
     throwIfAborted(ownedSignal);
 
     // Dedupe concurrent connection attempts.
-    if (this.connectPromises.has(name)) {
-      return abortable(this.connectPromises.get(name)!, ownedSignal);
+    const existingConnect = this.connectPromises.get(name);
+    if (existingConnect) {
+      const existingAuthority = this.connectOAuthAuthorities.get(name);
+      let reusable = oauthAuthority === undefined && existingAuthority === undefined;
+      if (oauthAuthority && existingAuthority) {
+        try {
+          existingAuthority();
+          reusable = true;
+        } catch {
+          reusable = false;
+        }
+      }
+      if (reusable) return abortable(existingConnect, ownedSignal);
+      const replacedAttempt = this.connectAttempts.get(name);
+      replacedAttempt?.abort(new Error(`MCP connection ${name} was replaced`));
+      if (this.connectAttempts.get(name) === replacedAttempt) this.connectAttempts.delete(name);
+      if (this.connectPromises.get(name) === existingConnect) this.connectPromises.delete(name);
+      if (this.connectOAuthAuthorities.get(name) === existingAuthority) {
+        this.connectOAuthAuthorities.delete(name);
+      }
     }
 
     const existing = this.connections.get(name);
@@ -365,11 +407,20 @@ export class McpServerManager {
     const generation = this.closeGenerations.get(name) ?? 0;
     const attemptController = new AbortController();
     const attemptSignal = combineAbortSignals(ownedSignal, attemptController.signal);
-    const connectionAttempt = this.createConnection(name, definition, attemptSignal, ownedSignal, credentialsInvalidated);
+    const connectionAttempt = this.createConnection(
+      name,
+      definition,
+      attemptSignal,
+      ownedSignal,
+      credentialsInvalidated,
+      oauthAuthority,
+      attemptController,
+    );
     const promise = definition.url
       ? connectionAttempt.catch(async error => { throw await this.enrichHttpConnectionError(definition, error); })
       : connectionAttempt;
     this.connectPromises.set(name, promise);
+    if (oauthAuthority) this.connectOAuthAuthorities.set(name, oauthAuthority);
     this.connectAttempts.set(name, attemptController);
 
     try {
@@ -385,8 +436,14 @@ export class McpServerManager {
         void this.ensureListen(name, connection);
       }
       return connection;
+    } catch (error) {
+      if (oauthAuthority) this.deactivateOAuthProvider(name, oauthAuthority);
+      throw error;
     } finally {
       if (this.connectPromises.get(name) === promise) this.connectPromises.delete(name);
+      if (this.connectOAuthAuthorities.get(name) === oauthAuthority) {
+        this.connectOAuthAuthorities.delete(name);
+      }
       if (this.connectAttempts.get(name) === attemptController) this.connectAttempts.delete(name);
     }
   }
@@ -803,6 +860,8 @@ export class McpServerManager {
     signal?: AbortSignal,
     requestSignal?: AbortSignal,
     credentialsInvalidated = false,
+    oauthAuthority?: OAuthAuthority,
+    attemptOwner?: AbortController,
   ): Promise<ServerConnection> {
     throwIfAborted(signal);
 
@@ -878,6 +937,8 @@ export class McpServerManager {
         signal,
         traceObserver,
         invalidated,
+        oauthAuthority,
+        attemptOwner,
       );
       client = httpConnection.client;
       transport = httpConnection.transport;
@@ -948,6 +1009,7 @@ export class McpServerManager {
       client.onclose = () => {
         if (this.connections.get(name) === connection) {
           connection.status = "closed";
+          this.deactivateOAuthProvider(name);
         }
       };
 
@@ -1226,6 +1288,8 @@ export class McpServerManager {
     signal?: AbortSignal,
     traceObserver?: McpTraceObserver,
     credentialsInvalidated = false,
+    oauthAuthority?: OAuthAuthority,
+    attemptOwner?: AbortController,
   ): Promise<{ client: Client; transport: Transport; status: "connected" | "needs-auth"; credentialsInvalidated: boolean }> {
     throwIfAborted(signal);
     const serverUrl = resolveServerUrl(definition)!;
@@ -1273,6 +1337,11 @@ export class McpServerManager {
     let caFetch = createCaFetch(definition);
     try {
     const createAuthProvider = (): McpOAuthProvider => {
+      const currentAttempt = this.connectAttempts.get(serverName);
+      if (currentAttempt && currentAttempt !== attemptOwner) {
+        throw new Error(`MCP connection for ${serverName} was replaced while connecting`);
+      }
+      if (!oauthAuthority) throw new Error(`Missing OAuth authority for ${serverName}`);
       const provider = new McpOAuthProvider(
         serverName,
         serverUrl,
@@ -1280,11 +1349,14 @@ export class McpServerManager {
         { onRedirect: async () => {} },
         this.authStorageOptions,
         this.oauthRuntime?.signal,
+        undefined,
+        oauthAuthority,
       );
       provider.setAuthFetch(createOAuthFetch(serverUrl, () => serviceHeaders,
         combineAbortSignals(this.oauthRuntime?.signal, signal), {
           ...(caFetch ? { delegate: caFetch.fetch } : {}),
         }));
+      this.setOAuthProvider(serverName, provider);
       return provider;
     };
 
@@ -1342,9 +1414,8 @@ export class McpServerManager {
         : requestFetch;
       const transportOptions = {
         ...(requestInit !== undefined ? { requestInit } : {}),
-        ...(authProvider !== undefined
-          ? { fetch: createOAuthAwareFetch(transportFetch), authProvider }
-          : transportFetch !== undefined ? { fetch: transportFetch } : {}),
+        ...(transportFetch !== undefined ? { fetch: transportFetch } : {}),
+        ...(authProvider !== undefined ? { authProvider } : {}),
         ...(authProvider !== undefined
           && definition.oauth !== false
           && definition.oauth?.skipIssuerMetadataValidation === true
@@ -1605,6 +1676,7 @@ export class McpServerManager {
   }
 
   async close(name: string): Promise<void> {
+    this.deactivateOAuthProvider(name);
     this.closeGenerations.set(name, (this.closeGenerations.get(name) ?? 0) + 1);
     this.connectAttempts.get(name)?.abort(new Error(`MCP connection ${name} was closed`));
     this.pendingMetadataPublications.delete(name);
@@ -1651,8 +1723,9 @@ export class McpServerManager {
 
   async closeAll(): Promise<void> {
     this.stopped = true;
-    const names = new Set([...this.connections.keys(), ...this.connectPromises.keys()]);
+    const names = new Set([...this.connections.keys(), ...this.connectPromises.keys(), ...this.oauthProviders.keys()]);
     for (const name of names) {
+      this.deactivateOAuthProvider(name);
       this.closeGenerations.set(name, (this.closeGenerations.get(name) ?? 0) + 1);
       this.connectAttempts.get(name)?.abort(new Error(`MCP connection ${name} was closed`));
     }

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const mocks = vi.hoisted(() => ({
@@ -162,12 +162,9 @@ describe("mcp-auth-flow explicit auth", () => {
       .mockResolvedValueOnce(new Response(null, {
         headers: { "www-authenticate": 'Bearer resource_metadata="https://other.example.test/.well-known/oauth-protected-resource"' },
       }))
-      .mockImplementationOnce((_input, init) => {
-        expect(init.signal.aborted).toBe(false);
-        return Promise.resolve(new Response(JSON.stringify(metadata), {
-          headers: { "content-type": "application/json" },
-        }));
-      });
+      .mockResolvedValueOnce(new Response(JSON.stringify(metadata), {
+        headers: { "content-type": "application/json" },
+      }));
     mocks.sdkAuth.mockImplementationOnce(async (provider) => {
       await expect(provider.discoveryState()).resolves.toMatchObject({
         authorizationServerUrl: metadata.issuer,
@@ -190,6 +187,8 @@ describe("mcp-auth-flow explicit auth", () => {
     expect(new Headers(metadataInit.headers).has("x-service-auth")).toBe(false);
     expect(new Headers(mocks.fetch.mock.calls[0]![1].headers).get("x-service-auth")).toBe("synthetic-service");
     expect(metadataInit.signal).toBeInstanceOf(AbortSignal);
+    expect(metadataInit.signal.aborted).toBe(false);
+    controller.abort();
     expect(metadataInit.signal.aborted).toBe(true);
     expect(mocks.sdkAuth).toHaveBeenCalledWith(
       expect.anything(),
@@ -328,7 +327,17 @@ describe("mcp-auth-flow explicit auth", () => {
   });
 
   it("authenticates client_credentials non-interactively without callback server or browser", async () => {
-    const { authenticate } = await import("../mcp-auth-flow.ts");
+    let deactivateCalls = 0;
+    mocks.sdkAuth.mockImplementationOnce(async (provider) => {
+      const deactivate = provider.deactivate.bind(provider);
+      provider.deactivate = () => {
+        deactivateCalls += 1;
+        deactivate();
+      };
+      return "AUTHORIZED";
+    });
+    const { authenticate, createOAuthRuntime, shutdownOAuth } = await import("../mcp-auth-flow.ts");
+    const runtime = createOAuthRuntime();
 
     const status = await authenticate("svc", "https://api.example.com/mcp", {
       url: "https://api.example.com/mcp",
@@ -338,6 +347,7 @@ describe("mcp-auth-flow explicit auth", () => {
         clientId: "service-client",
         clientSecret: "service-secret",
       },
+      runtime,
     });
 
     expect(status).toBe("authenticated");
@@ -345,6 +355,265 @@ describe("mcp-auth-flow explicit auth", () => {
     expect(mocks.ensureCallbackServer).not.toHaveBeenCalled();
     expect(mocks.waitForCallback).not.toHaveBeenCalled();
     expect(mocks.open).not.toHaveBeenCalled();
+    expect(deactivateCalls).toBe(1);
+    await shutdownOAuth(runtime);
+    expect(deactivateCalls).toBe(1);
+  });
+
+  it("fences delayed client_credentials registration after credential removal", async () => {
+    let release!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    mocks.sdkAuth.mockImplementationOnce(async (provider) => {
+      markStarted();
+      await gate;
+      await provider.saveClientInformation({ client_id: "late-service-client" });
+      await provider.saveTokens({ access_token: "late-service-token", token_type: "Bearer" });
+      return "AUTHORIZED";
+    });
+    const { removeAuth, startAuth } = await import("../mcp-auth-flow.ts");
+    const { getAuthForUrl } = await import("../mcp-auth.ts");
+    const serverUrl = "https://api.example.com/mcp";
+
+    const pending = startAuth("late-service", serverUrl, {
+      url: serverUrl,
+      auth: "oauth",
+      oauth: { grantType: "client_credentials", clientId: "service-client" },
+    });
+    await started;
+    await removeAuth("late-service");
+    release();
+
+    await expect(pending).rejects.toThrow("OAuth flow is no longer active");
+    expect(getAuthForUrl("late-service", serverUrl)).toBeUndefined();
+  });
+
+  it("fences delayed dynamic registration before pending auth is installed", async () => {
+    let release!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    mocks.sdkAuth.mockImplementationOnce(async (provider) => {
+      markStarted();
+      await gate;
+      await provider.saveClientInformation({ client_id: "late-dynamic-client" });
+      return "REDIRECT";
+    });
+    const { removeAuth, startAuth } = await import("../mcp-auth-flow.ts");
+    const { getAuthForUrl } = await import("../mcp-auth.ts");
+    const serverUrl = "https://api.example.com/mcp";
+
+    const pending = startAuth("late-dynamic", serverUrl, { url: serverUrl, auth: "oauth" });
+    await started;
+    await removeAuth("late-dynamic");
+    release();
+
+    await expect(pending).rejects.toThrow("OAuth flow is no longer active");
+    expect(getAuthForUrl("late-dynamic", serverUrl)).toBeUndefined();
+  });
+
+  it("rejects an auth operation that was suspended before provider construction", async () => {
+    let release!: () => void;
+    const callbackStartup = new Promise<void>(resolve => { release = resolve; });
+    mocks.ensureCallbackServer.mockReturnValueOnce(callbackStartup);
+    const { removeAuth, startAuth } = await import("../mcp-auth-flow.ts");
+
+    const pending = startAuth("pre-constructor", "https://api.example.com/mcp", { auth: "oauth" });
+    expect(mocks.ensureCallbackServer).toHaveBeenCalledOnce();
+    await removeAuth("pre-constructor");
+    release();
+
+    await expect(pending).rejects.toThrow("OAuth flow is no longer active");
+    expect(mocks.sdkAuth).not.toHaveBeenCalled();
+    expect(mocks.releaseCallbackServer).toHaveBeenCalledOnce();
+  });
+
+  it("keeps admission closed across overlapping logout cleanup and reopens afterward", async () => {
+    let releaseFirst!: () => void;
+    let rejectSecond!: (error: Error) => void;
+    mocks.stopCallbackServerIfIdle
+      .mockImplementationOnce(() => new Promise<void>(resolve => { releaseFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectSecond = reject; }));
+    const { removeAuth, startAuth } = await import("../mcp-auth-flow.ts");
+    const definition = {
+      url: "https://api.example.com/mcp",
+      auth: "oauth" as const,
+      oauth: { grantType: "client_credentials" as const, clientId: "client" },
+    };
+
+    const first = removeAuth("overlap");
+    const second = removeAuth("overlap");
+    await expect(startAuth("overlap", definition.url, definition)).rejects.toThrow("OAuth flow is no longer active");
+    releaseFirst();
+    await first;
+    await expect(startAuth("overlap", definition.url, definition)).rejects.toThrow("OAuth flow is no longer active");
+    rejectSecond(new Error("cleanup failed"));
+    await expect(second).rejects.toThrow("cleanup failed");
+
+    await expect(startAuth("overlap", definition.url, definition)).resolves.toEqual({ authorizationUrl: "" });
+  });
+
+  it("detaches a pending flow before a failing credential-store read", async () => {
+    const reservedStates = new Set<string>();
+    mocks.ensureCallbackServer.mockImplementation(async ({ oauthState }) => {
+      reservedStates.add(oauthState);
+    });
+    mocks.cancelPendingCallback.mockImplementation(state => {
+      reservedStates.delete(state);
+    });
+    mocks.releaseCallbackServer.mockImplementation(state => {
+      reservedStates.delete(state);
+    });
+    let staleProvider: {
+      saveTokens(tokens: { access_token: string; token_type: string }): Promise<void>;
+    } | undefined;
+    mocks.sdkAuth
+      .mockImplementationOnce(async provider => {
+        staleProvider = provider;
+        await provider.redirectToAuthorization(new URL("https://auth.example.com/stale"));
+        return "REDIRECT";
+      })
+      .mockImplementationOnce(async provider => {
+        await provider.redirectToAuthorization(new URL("https://auth.example.com/fresh"));
+        return "REDIRECT";
+      });
+    const { hasPendingAuth, removeAuth, startAuth } = await import("../mcp-auth-flow.ts");
+    const serverName = "failing-store-detach";
+    const serverUrl = "https://api.example.com/mcp";
+    const previousCacheSetting = process.env.PI_MCP_ADAPTER_DISABLE_AUTH_CACHE;
+    process.env.PI_MCP_ADAPTER_DISABLE_AUTH_CACHE = "1";
+
+    try {
+      await expect(startAuth(serverName, serverUrl, { auth: "oauth" }))
+        .resolves.toEqual({ authorizationUrl: "https://auth.example.com/stale" });
+      expect(hasPendingAuth(serverName)).toBe(true);
+      expect(reservedStates.size).toBe(1);
+
+      process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "unavailable";
+      await expect(removeAuth(serverName)).rejects.toMatchObject({
+        operation: "read",
+        message: expect.stringContaining("Failed to read OAuth credentials"),
+      });
+
+      expect(hasPendingAuth(serverName)).toBe(false);
+      expect(reservedStates.size).toBe(0);
+      await expect(staleProvider!.saveTokens({ access_token: "late-token", token_type: "Bearer" }))
+        .rejects.toThrow("OAuth flow is no longer active");
+
+      process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+      await expect(startAuth(serverName, serverUrl, { auth: "oauth" }))
+        .resolves.toEqual({ authorizationUrl: "https://auth.example.com/fresh" });
+      expect(hasPendingAuth(serverName)).toBe(true);
+      expect(reservedStates.size).toBe(1);
+      await removeAuth(serverName);
+    } finally {
+      process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+      if (previousCacheSetting === undefined) delete process.env.PI_MCP_ADAPTER_DISABLE_AUTH_CACHE;
+      else process.env.PI_MCP_ADAPTER_DISABLE_AUTH_CACHE = previousCacheSetting;
+    }
+  });
+
+  it("invalidates the same server across runtimes and legacy directories without affecting another server", async () => {
+    const { createOAuthRuntime, removeAuth } = await import("../mcp-auth-flow.ts");
+    const { McpOAuthProvider } = await import("../mcp-oauth-provider.ts");
+    const { getAuthForUrl } = await import("../mcp-auth.ts");
+    const firstRuntime = createOAuthRuntime();
+    const secondRuntime = createOAuthRuntime();
+    const firstDir = join(authDir, "first");
+    const secondDir = join(authDir, "second");
+    const serverUrl = "https://api.example.com/mcp";
+    delete process.env.MCP_OAUTH_DIR;
+    try {
+      const first = new McpOAuthProvider("shared-account", serverUrl, {}, { onRedirect: async () => {} },
+        { baseDir: firstDir }, firstRuntime.signal);
+      const second = new McpOAuthProvider("shared-account", serverUrl, {}, { onRedirect: async () => {} },
+        { baseDir: secondDir }, secondRuntime.signal);
+      const other = new McpOAuthProvider("other-account", serverUrl, {}, { onRedirect: async () => {} },
+        { baseDir: firstDir });
+
+      await removeAuth("shared-account", { runtime: firstRuntime, authStorageOptions: { baseDir: firstDir } });
+
+      await expect(first.saveTokens({ access_token: "late-first", token_type: "Bearer" }))
+        .rejects.toThrow("OAuth flow is no longer active");
+      await expect(second.saveClientInformation({ client_id: "late-second" }))
+        .rejects.toThrow("OAuth flow is no longer active");
+      await other.saveTokens({ access_token: "other-token", token_type: "Bearer" });
+      expect(getAuthForUrl("shared-account", serverUrl, { baseDir: secondDir })).toBeUndefined();
+      expect(getAuthForUrl("other-account", serverUrl, { baseDir: firstDir })?.tokens?.accessToken).toBe("other-token");
+    } finally {
+      process.env.MCP_OAUTH_DIR = authDir;
+    }
+  });
+
+  it("does not let stale startup cleanup remove a replacement flow or credentials", async () => {
+    let releaseOld!: () => void;
+    mocks.ensureCallbackServer.mockImplementationOnce(
+      () => new Promise<void>(resolve => { releaseOld = resolve; }),
+    );
+    const { hasPendingAuth, removeAuth, startAuth } = await import("../mcp-auth-flow.ts");
+    const { getAuthForUrl } = await import("../mcp-auth.ts");
+    const serverUrl = "https://api.example.com/mcp";
+
+    const oldStart = startAuth("replacement", serverUrl, { auth: "oauth" });
+    await removeAuth("replacement");
+    mocks.sdkAuth.mockImplementationOnce(async provider => {
+      await provider.saveClientInformation({ client_id: "replacement-client" });
+      await provider.redirectToAuthorization(new URL("https://auth.example.com/new"));
+      return "REDIRECT";
+    });
+    await expect(startAuth("replacement", serverUrl, { auth: "oauth" }))
+      .resolves.toEqual({ authorizationUrl: "https://auth.example.com/new" });
+    releaseOld();
+    await expect(oldStart).rejects.toThrow("OAuth flow is no longer active");
+
+    expect(hasPendingAuth("replacement")).toBe(true);
+    expect(getAuthForUrl("replacement", serverUrl)?.clientInfo?.clientId).toBe("replacement-client");
+  });
+
+  it("clears explicit updates before the final logout boundary and preserves later updates", async () => {
+    let releaseCleanup!: () => void;
+    mocks.stopCallbackServerIfIdle.mockImplementationOnce(
+      () => new Promise<void>(resolve => { releaseCleanup = resolve; }),
+    );
+    const { removeAuth } = await import("../mcp-auth-flow.ts");
+    const { getAuthForUrl } = await import("../mcp-auth.ts");
+    const { updateMcpOAuthTokensForUrl } = await import("../oauth.ts");
+    const serverUrl = "https://api.example.com/mcp";
+
+    const logout = removeAuth("explicit-order");
+    await updateMcpOAuthTokensForUrl("explicit-order", serverUrl, { accessToken: "before-clear" });
+    releaseCleanup();
+    await logout;
+    expect(getAuthForUrl("explicit-order", serverUrl)).toBeUndefined();
+
+    await updateMcpOAuthTokensForUrl("explicit-order", serverUrl, { accessToken: "after-logout" });
+    expect(getAuthForUrl("explicit-order", serverUrl)?.tokens?.accessToken).toBe("after-logout");
+  });
+
+  it("does not reimport legacy plaintext from another directory after local logout", async () => {
+    const { removeAuth } = await import("../mcp-auth-flow.ts");
+    const { getAuthEntryFilePath, getAuthForUrl, inspectAuthForUrl } = await import("../mcp-auth.ts");
+    const serverUrl = "https://api.example.com/mcp";
+    const legacyDir = join(authDir, "unknown-legacy-dir");
+
+    await removeAuth("legacy-tombstone");
+    const filePath = getAuthEntryFilePath("legacy-tombstone", { baseDir: legacyDir });
+    mkdirSync(dirname(filePath), { recursive: true });
+    writeFileSync(filePath, JSON.stringify({
+      serverUrl,
+      tokens: { accessToken: "legacy-token" },
+    }));
+
+    const previousDir = process.env.MCP_OAUTH_DIR;
+    delete process.env.MCP_OAUTH_DIR;
+    try {
+      expect(getAuthForUrl("legacy-tombstone", serverUrl, { baseDir: legacyDir })).toBeUndefined();
+      expect(inspectAuthForUrl("legacy-tombstone", serverUrl, { baseDir: legacyDir })).toEqual({ status: "absent" });
+    } finally {
+      if (previousDir === undefined) delete process.env.MCP_OAUTH_DIR;
+      else process.env.MCP_OAUTH_DIR = previousDir;
+    }
   });
 
   it("clears stale dynamic client info before client_credentials auth", async () => {
@@ -440,7 +709,13 @@ describe("mcp-auth-flow explicit auth", () => {
   });
 
   it("refreshes expired tokens through SDK auth before returning them", async () => {
+    let deactivateCalls = 0;
     mocks.sdkAuth.mockImplementationOnce(async (provider) => {
+      const deactivate = provider.deactivate.bind(provider);
+      provider.deactivate = () => {
+        deactivateCalls += 1;
+        deactivate();
+      };
       await provider.saveTokens({
         access_token: "new-access",
         token_type: "Bearer",
@@ -449,8 +724,9 @@ describe("mcp-auth-flow explicit auth", () => {
       });
       return "AUTHORIZED";
     });
-    const { getValidToken } = await import("../mcp-auth-flow.ts");
+    const { createOAuthRuntime, getValidToken, shutdownOAuth } = await import("../mcp-auth-flow.ts");
     const { updateClientInfo, updateTokens } = await import("../mcp-auth.ts");
+    const runtime = createOAuthRuntime();
 
     updateClientInfo("refresh", { clientId: "client", redirectUris: ["http://localhost:19876/callback"] }, "https://api.example.com/mcp");
     updateTokens("refresh", {
@@ -459,10 +735,67 @@ describe("mcp-auth-flow explicit auth", () => {
       expiresAt: Date.now() / 1000 - 60,
     }, "https://api.example.com/mcp");
 
-    const token = await getValidToken("refresh", "https://api.example.com/mcp");
+    const token = await getValidToken("refresh", "https://api.example.com/mcp", { runtime });
 
     expect(token?.accessToken).toBe("new-access");
     expect(mocks.sdkAuth).toHaveBeenCalledTimes(1);
+    expect(deactivateCalls).toBe(1);
+    await shutdownOAuth(runtime);
+    expect(deactivateCalls).toBe(1);
+  });
+
+  it("fences a delayed refresh response after credential removal", async () => {
+    let release!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    mocks.sdkAuth.mockImplementationOnce(async (provider) => {
+      markStarted();
+      await gate;
+      await provider.saveTokens({ access_token: "late-access", token_type: "Bearer" });
+      return "AUTHORIZED";
+    });
+    const { getValidToken, removeAuth } = await import("../mcp-auth-flow.ts");
+    const { getAuthForUrl, updateClientInfo, updateTokens } = await import("../mcp-auth.ts");
+    const serverUrl = "https://api.example.com/mcp";
+    updateClientInfo("late-refresh", {
+      clientId: "client",
+      redirectUris: ["http://localhost:19876/callback"],
+    }, serverUrl);
+    updateTokens("late-refresh", {
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() / 1000 - 60,
+    }, serverUrl);
+
+    const pending = getValidToken("late-refresh", serverUrl);
+    await started;
+    await removeAuth("late-refresh");
+    release();
+
+    await expect(pending).resolves.toBeNull();
+    expect(getAuthForUrl("late-refresh", serverUrl)).toBeUndefined();
+  });
+
+  it("does not refresh work suspended at its initial credential read after logout", async () => {
+    const { getValidToken, removeAuth } = await import("../mcp-auth-flow.ts");
+    const { updateClientInfo, updateTokens } = await import("../mcp-auth.ts");
+    const serverUrl = "https://api.example.com/mcp";
+    updateClientInfo("pre-refresh", {
+      clientId: "client",
+      redirectUris: ["http://localhost:19876/callback"],
+    }, serverUrl);
+    updateTokens("pre-refresh", {
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() / 1000 - 60,
+    }, serverUrl);
+
+    const pending = getValidToken("pre-refresh", serverUrl);
+    await removeAuth("pre-refresh");
+
+    await expect(pending).resolves.toBeNull();
+    expect(mocks.sdkAuth).not.toHaveBeenCalled();
   });
 
   it("passes the issuer metadata validation opt-out during token refresh", async () => {
