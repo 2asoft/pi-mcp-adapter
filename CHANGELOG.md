@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+## [2.34.0] - 2026-09-14
 
-- Runtime-heavy MCP modules now load only when first needed while cached tools and commands remain synchronously available. Thanks to [@thefakepaulgg](https://github.com/thefakepaulgg) for PR #576.
-- Cross-process OAuth credential transaction serialization is temporarily withdrawn until matching official MCP client/core registry releases support the required hook and deduplication semantics. Registry-only dependencies restore default npm 12 installs and avoid the standalone native-addon dependency.
+### Highlights
+
+- Start Pi faster while keeping cached MCP tools, prompts, and commands immediately available.
+- Connect to more OAuth servers with Client ID Metadata Documents.
+- Store OAuth credentials securely in encrypted files when Windows OpenSSH or a headless session cannot use the OS credential store.
+- Load shared configuration and Agent Plugin MCP servers more reliably.
+- Use MCP Apps, private HTTPS servers, and frequently changing tool catalogs with fewer connection problems.
 
 ### Added
 
@@ -18,10 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OAuth servers can explicitly opt into operator-hosted Client ID Metadata Documents (SEP-991) with `oauth.clientMetadataUrl`; URL-only/default configurations continue using Dynamic Client Registration. Existing DCR refresh credentials get their normal refresh attempt before migration to CIMD after invalidation. Thanks to [@dsluo](https://github.com/dsluo) for PR #571.
 - User-global or explicitly selected config can opt in to bounded ancestor `.mcp.json` and `<configDir>/mcp.json` discovery with `settings.ancestorConfigRoots`. Discovery is off by default; project files cannot enable or widen it, and the deepest matching existing directory under `$HOME` bounds farthest-first loading. Thanks to [@johnhenaot](https://github.com/johnhenaot) for PR #555.
 
+### Changed
+
+- Runtime-heavy MCP modules now load only when first needed, while cached tools, prompts, and commands remain immediately available. Thanks to [@thefakepaulgg](https://github.com/thefakepaulgg) for PR #576.
+- OAuth dependencies now use published MCP SDK releases again, restoring normal npm installs and removing the standalone native-addon dependency. Cross-process OAuth transaction serialization remains unavailable until the official SDK exposes the required support.
+
 ### Fixed
-- Built-in Agent Plugin MCP definitions now preserve literal values through connection and cache handling, validate manifest field types, resolve contained paths through symlinks, and expand plugin placeholders once. Thanks to @cheetahbyte for #570.
-- Empty, whitespace-only, or comments-only optional MCP config layers are now treated as absent, allowing other precedence layers to load without a warning. Thanks to @RobertoNegro for PR #567.
-- macOS Keychain and Linux Secret Service now keep ordinary OAuth records in one credential item and compact existing chunks on ordinary reads; Windows Credential Manager retains chunking. Thanks to @jploskonka for PR #560.
+
+- Built-in Agent Plugin MCP definitions now preserve literal values through connection and cache handling, validate manifest field types, resolve contained paths through symlinks, and expand plugin placeholders once. Thanks to [@cheetahbyte](https://github.com/cheetahbyte) for #570.
+- Empty, whitespace-only, or comments-only optional MCP config layers are now treated as absent, allowing other precedence layers to load without a warning. Thanks to [@RobertoNegro](https://github.com/RobertoNegro) for PR #567.
+- macOS Keychain and Linux Secret Service now keep ordinary OAuth records in one credential item and compact existing chunks on ordinary reads; Windows Credential Manager retains chunking. Thanks to [@jploskonka](https://github.com/jploskonka) for PR #560.
 - Configured direct tools now hot-load from fresh live catalogs even when a server advertises `ttlMs: 0`, while persisted zero-TTL metadata remains non-cacheable. Thanks to [@dsluo](https://github.com/dsluo) for PR #562. (#561)
 - Switching a server between transports (HTTP to stdio command or socket) now drops an inherited `bearerTokenStore` flag alongside the other URL-bound credential fields. Thanks to [@zhulinchng](https://github.com/zhulinchng) for PR #552.
 - Per-origin `caFile` trust now routes same-origin requests through the bundled undici fetch so the custom CA dispatcher matches the fetch implementation on newer Node releases (Node 26 ships undici v8 while the dependency pins undici v6); previously every `caFile` connection failed with `UND_ERR_INVALID_ARG`. Thanks to [@zhulinchng](https://github.com/zhulinchng) for PR #550.
