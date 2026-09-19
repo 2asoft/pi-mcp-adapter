@@ -1,5 +1,5 @@
 import type { AgentToolResult, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { UrlElicitationRequiredError, type Client, type Progress, type RequestOptions } from "@modelcontextprotocol/client";
+import { UrlElicitationRequiredError, type Client, type JsonSchemaType, type JsonSchemaValidator, type Progress, type RequestOptions } from "@modelcontextprotocol/client";
 import { createRequire } from "node:module";
 import type { McpExtensionState } from "./state.ts";
 import type { ToolMetadata, McpContent } from "./types.ts";
@@ -20,13 +20,31 @@ import { paginate, rankSuggestions, rankToolMatches, resolveSearchKeywords } fro
 import { ensureToolCallApproved, isToolCallApprovalRequired } from "./tool-approval.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
 import { getInputRequiredNeedsUiDetails } from "./errors.ts";
+import { createJsonSchemaValidator } from "./json-schema-validator.ts";
 
 type ProxyToolResult = AgentToolResult<Record<string, unknown>>;
 type ClientCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
 type ClientReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
 
 const require = createRequire(import.meta.url);
+const proxyArgumentValidators = new WeakMap<object, JsonSchemaValidator<unknown>>();
 const MAX_REGEX_SEARCH_QUERY_LENGTH = 256;
+
+function proxyArgumentValidationError(inputSchema: unknown, args: unknown): string | null {
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return null;
+  try {
+    let validate = proxyArgumentValidators.get(inputSchema);
+    if (!validate) {
+      validate = createJsonSchemaValidator().getValidator(inputSchema as JsonSchemaType);
+      proxyArgumentValidators.set(inputSchema, validate);
+    }
+    const result = validate(args);
+    return result.valid ? null : result.errorMessage ?? "arguments do not match the advertised input schema";
+  } catch {
+    // Preserve server-side validation for schema dialects the adapter cannot evaluate.
+    return null;
+  }
+}
 const INSTRUCTIONS_PREVIEW_LENGTH = 300;
 const REGEX_SAFETY_CHECK_PARAMS = {
   attackTimeout: 50,
@@ -1390,6 +1408,18 @@ export async function executeCall(
   }
 
   const normalizedArgs = toolMeta.resourceUri ? args ?? {} : normalizeToolArguments(args);
+  const validationError = toolMeta.resourceUri ? null : proxyArgumentValidationError(toolMeta.inputSchema, normalizedArgs);
+  if (validationError) {
+    const schemaText = `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
+    const guarded = await guardMcpOutput(
+      [{ type: "text" as const, text: validationError }],
+      { ...resolveMcpOutputGuardOptions(state.config.settings), prefix: "Failed to call tool: ", suffix: schemaText },
+    );
+    return {
+      content: guarded.content,
+      details: { mode: "call", error: "call_failed", ...callIdentity, message: validationError, ...guardedMcpDetails(guarded) },
+    };
+  }
   const approval = await ensureToolCallApproved(
     state,
     serverName,
@@ -1530,8 +1560,7 @@ export async function executeCall(
         const mcpContent = (result.content ?? []) as McpContent[];
         const content = transformMcpContent(mcpContent, state.owner?.signal);
         const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
-        const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
-        const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
+        const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", emptyTextFallback: "Tool execution failed", rawMcpResult: result });
         return {
           content: guarded.content,
           details: { mode: "call", error: "tool_error", ...callIdentity, ...guardedMcpDetails(guarded) },
@@ -1559,8 +1588,7 @@ export async function executeCall(
       const mcpContent = (result.content ?? []) as McpContent[];
       const content = transformMcpContent(mcpContent, state.owner?.signal);
       const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
-      const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
-      const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
+      const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", emptyTextFallback: "Tool execution failed", rawMcpResult: result });
       return {
         content: guarded.content,
         details: { mode: "call", error: "tool_error", ...callIdentity, ...guardedMcpDetails(guarded) },
