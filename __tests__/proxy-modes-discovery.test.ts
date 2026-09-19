@@ -348,7 +348,7 @@ describe("proxy discovery", () => {
     expect(callTool).toHaveBeenCalledTimes(1);
   });
 
-  it("resolves a raw upstream name for an explicitly selected server", async () => {
+  it("resolves displayed and raw upstream names for an explicitly selected server", async () => {
     const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "called" }] }));
     const state = {
       config: { mcpServers: { codegraph: { command: "codegraph" } } },
@@ -367,6 +367,15 @@ describe("proxy discovery", () => {
       completedUiSessions: [],
     } as unknown as McpExtensionState;
 
+    expect(executeDescribe(state, "codegraph_codegraph_explore", "codegraph").details).toMatchObject({
+      server: "codegraph",
+      tool: { originalName: "codegraph_explore" },
+    });
+    expect(executeDescribe(state, "codegraph_explore", "codegraph").details).toMatchObject({
+      server: "codegraph",
+      tool: { originalName: "codegraph_explore" },
+    });
+
     const result = await executeCall(state, "codegraph_explore", { query: "identity provider" }, "codegraph");
 
     expect(result.details).toMatchObject({ server: "codegraph", tool: "codegraph_explore" });
@@ -375,6 +384,71 @@ describe("proxy discovery", () => {
       { name: "codegraph_explore", arguments: { query: "identity provider" }, _meta: undefined },
       undefined,
     );
+  });
+
+  it("fails closed for same-server displayed and raw exact-name collisions", async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "called" }] }));
+    const state = {
+      config: { mcpServers: { demo: { command: "demo" } } },
+      toolMetadata: new Map([["demo", [
+        { name: "demo_search", originalName: "search", description: "Displayed match" },
+        { name: "demo_demo_search", originalName: "demo_search", description: "Raw match" },
+      ]]]),
+      manager: {
+        getConnection: () => ({ status: "connected", client: { callTool } }),
+        touch: () => {},
+        incrementInFlight: () => {},
+        decrementInFlight: () => {},
+        getRequestOptions: () => undefined,
+      },
+      failureTracker: new Map(),
+      serverInstructions: new Map(),
+      completedUiSessions: [],
+    } as unknown as McpExtensionState;
+
+    expect(executeDescribe(state, "demo_search", "demo").details).toMatchObject({
+      error: "ambiguous_tool",
+      server: "demo",
+    });
+    await expect(executeCall(state, "demo_search", {}, "demo")).resolves.toMatchObject({
+      details: { error: "ambiguous_tool", server: "demo" },
+    });
+    expect(callTool).not.toHaveBeenCalled();
+
+    expect(executeDescribe(state, "demo_search").details).toMatchObject({
+      server: "demo",
+      tool: { originalName: "search" },
+    });
+  });
+
+  it("fails closed for same-server normalized displayed and raw-name collisions", async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "called" }] }));
+    const state = {
+      config: { mcpServers: { demo: { command: "demo" } } },
+      toolMetadata: new Map([["demo", [
+        { name: "demo_search-item", originalName: "search-item", description: "Displayed match" },
+        { name: "demo_other", originalName: "demo-search_item", description: "Raw match" },
+      ]]]),
+      manager: {
+        getConnection: () => ({ status: "connected", client: { callTool } }),
+        touch: () => {},
+        incrementInFlight: () => {},
+        decrementInFlight: () => {},
+        getRequestOptions: () => undefined,
+      },
+      failureTracker: new Map(),
+      serverInstructions: new Map(),
+      completedUiSessions: [],
+    } as unknown as McpExtensionState;
+
+    expect(executeDescribe(state, "demo_search_item", "demo").details).toMatchObject({
+      error: "ambiguous_tool",
+      server: "demo",
+    });
+    await expect(executeCall(state, "demo_search_item", {}, "demo")).resolves.toMatchObject({
+      details: { error: "ambiguous_tool", server: "demo" },
+    });
+    expect(callTool).not.toHaveBeenCalled();
   });
 
   it("fails closed for same-server normalized original-name collisions", async () => {
@@ -397,8 +471,48 @@ describe("proxy discovery", () => {
       completedUiSessions: [],
     } as unknown as McpExtensionState;
 
-    await expect(executeCall(state, "search__one", {}, "demo")).resolves.toMatchObject({ details: { error: "ambiguous_tool" } });
+    const describeResult = executeDescribe(state, "search__one", "demo");
+    expect(describeResult.details).toMatchObject({ error: "ambiguous_tool", server: "demo" });
+    expect(describeResult.content[0].text).toContain('matches multiple tools on server "demo"');
+    expect(describeResult.content[0].text).toContain('mcp({ server: "demo" })');
+
+    const callResult = await executeCall(state, "search__one", {}, "demo");
+    expect(callResult.details).toMatchObject({ error: "ambiguous_tool", server: "demo" });
+    expect(callResult.content[0].text).toContain('matches multiple tools on server "demo"');
     expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("reports server-scoped describe errors without searching other servers", () => {
+    const state = createState();
+
+    expect(executeDescribe(state, "search", "missing").details).toMatchObject({
+      error: "server_not_found",
+      server: "missing",
+      requestedTool: "search",
+    });
+    const missingTool = executeDescribe(state, "missing", "demo");
+    expect(missingTool.details).toMatchObject({
+      error: "tool_not_found",
+      server: "demo",
+      requestedTool: "missing",
+    });
+    expect(missingTool.content[0].text).toContain('Tool "missing" not found on server "demo"');
+    expect(missingTool.content[0].text).toContain('mcp({ search: "...", server: "demo" })');
+  });
+
+  it("keeps server-scoped describe suggestions on the selected server", () => {
+    const state = createState();
+    state.config.mcpServers.other = { command: "other" };
+    state.toolMetadata.set("other", [{
+      name: "other_search",
+      originalName: "search",
+      description: "Search other records",
+    }]);
+
+    expect(executeDescribe(state, "demo_sear", "demo").details).toMatchObject({
+      error: "tool_not_found",
+      suggestions: ["demo_search"],
+    });
   });
 
   it("tells callers to invoke native Pi tools directly", async () => {
