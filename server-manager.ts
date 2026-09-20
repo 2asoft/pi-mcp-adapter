@@ -79,6 +79,7 @@ import {
 import { createOAuthFetch, resolveOAuthHeaders } from "./mcp-auth-fetch.ts";
 import { createRequestHeadersCommandFetch } from "./request-headers-command.ts";
 import { createCaFetch, validateCaFile } from "./http-ca.ts";
+import { BearerCommandResolver } from "./bearer-command-resolver.ts";
 
 const MAX_CAPTURED_STDERR_BYTES = 8 * 1024;
 const MAX_CAPTURED_STDERR_LINES = 3;
@@ -120,8 +121,12 @@ function localNetworkFailureCodes(error: unknown, seen = new Set<object>()): str
   return [...new Set(codes)];
 }
 
-function isUnauthorizedHttpError(error: unknown): boolean {
-  return error instanceof UnauthorizedError || (error instanceof SdkHttpError && error.status === 401);
+export function isUnauthorizedHttpError(error: unknown): boolean {
+  return error instanceof UnauthorizedError
+    || (error instanceof SdkHttpError && error.status === 401)
+    // Some pinned-SDK transport paths emit this plain Error when bearer
+    // request headers are used without an OAuth authProvider.
+    || (error instanceof Error && /^Error POSTing to endpoint \(HTTP 401\):/.test(error.message));
 }
 
 function shouldFallbackToSse(error: unknown, definition: ServerDefinition): boolean {
@@ -229,6 +234,24 @@ export function isTransientHttpConnectError(error: unknown): boolean {
     current = current.cause;
   }
   return false;
+}
+
+/** Wrap a FetchLike so each request re-resolves the bearer token via the resolver. */
+function createBearerCommandFetch(
+  resolver: BearerCommandResolver,
+  delegate: FetchLike | undefined,
+): FetchLike {
+  const innerFetch = delegate
+    ? (input: URL | RequestInfo, init?: RequestInit) => delegate(input as URL, init)
+    : (input: URL | RequestInfo, init?: RequestInit) => globalThis.fetch(input, init);
+  return async (input, init) => {
+    const request = new Request(input, init);
+    const token = await resolver.resolve(request.signal);
+    const headers = new Headers(request.headers);
+    headers.set("Authorization", `Bearer ${token}`);
+    // Composed runtime fetches accept Request despite the SDK's narrower type.
+    return innerFetch(new Request(request, { headers }));
+  };
 }
 
 export class McpServerManager {
@@ -1317,14 +1340,24 @@ export class McpServerManager {
     const commandBearer = definition.bearerToken?.startsWith("!") && !definition.bearerToken.startsWith("!!")
       ? definition.bearerToken
       : undefined;
+    // Command-backed bearers resolve eagerly, then refresh through a TTL cache.
+    let bearerCommandResolver: BearerCommandResolver | undefined;
     if (definition.auth === "bearer") {
-      const token = commandBearer
-        ? resolveCommandSecret(commandBearer, `MCP server "${serverName}" HTTP bearer token`)
-        : resolveBearerToken(definition)
+      if (commandBearer) {
+        bearerCommandResolver = new BearerCommandResolver(
+          commandBearer,
+          `MCP server "${serverName}" HTTP bearer token`,
+        );
+        // Eager resolve so a broken command surfaces at connect time, not at
+        // the first tool call.
+        await bearerCommandResolver.resolve(signal);
+      } else {
+        const token = resolveBearerToken(definition)
           ?? (definition.bearerToken === undefined && definition.bearerTokenEnv === undefined && definition.bearerTokenStore === true
             ? getBearerTokenForUrl(serverName, serverUrl)
             : undefined);
-      if (token) headers["Authorization"] = `Bearer ${token}`;
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+      }
     }
 
     if (hasCommandHeader || commandBearer) {
@@ -1390,13 +1423,17 @@ export class McpServerManager {
     const commandFetch = definition.requestHeadersCommand
       ? createRequestHeadersCommandFetch(definition.requestHeadersCommand, caFetch?.fetch)
       : caFetch?.fetch;
+    // requestHeadersCommand stays last in the header chain.
+    const bearerFetch = bearerCommandResolver
+      ? createBearerCommandFetch(bearerCommandResolver, commandFetch)
+      : commandFetch;
     const requestFetch = oauthEnabled
       ? createOAuthFetch(serverUrl, () => serviceHeaders, this.oauthRuntime?.signal, {
         // MCP streams outlive individual auth requests; retain SDK request deadlines.
         timeout: false,
-        ...(commandFetch ? { delegate: commandFetch } : {}),
+        ...(bearerFetch ? { delegate: bearerFetch } : {}),
       })
-      : commandFetch;
+      : bearerFetch;
     const attempt = async (
       kind: "streamable-http" | "sse",
     ): Promise<
