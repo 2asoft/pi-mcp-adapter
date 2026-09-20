@@ -1,5 +1,5 @@
 // config.ts - Config loading with import support
-import { existsSync, readFileSync, realpathSync, statSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseToml } from "smol-toml";
@@ -9,6 +9,7 @@ import { getAgentPluginSummaries, loadAgentPluginConfigs } from "./agent-plugin-
 import { cloneBuiltInAgentPluginEntry, isBuiltInAgentPlugin, mergeBuiltInAgentPluginEntries } from "./agent-plugin-provenance.js";
 import { loadClaudePluginBundles } from "./claude-plugin-loader.js";
 import { loadPackageMcpConfigs } from "./package-mcp-loader.js";
+import { validateJevSettings } from "./jev-client.js";
 import { formatServerNamespace, isServerDisabled } from "./types.js";
 import { parseJsonWithComments, toStringRecord } from "./utils.js";
 const GENERIC_GLOBAL_CONFIG_PATH = join(homedir(), ".config", "mcp", "mcp.json");
@@ -696,9 +697,19 @@ function validateConfig(raw) {
     return {
         mcpServers: toServerEntries(raw.mcpServers ?? raw["mcp-servers"]),
         ...(Array.isArray(raw.imports) ? { imports: raw.imports } : {}),
-        ...(raw.settings !== undefined ? { settings: raw.settings } : {}),
+        ...(raw.settings !== undefined ? { settings: parseSettings(raw.settings) } : {}),
         ...(raw.claudePlugins !== undefined ? { claudePlugins: parseClaudePlugins(raw.claudePlugins) } : {}),
     };
+}
+function parseSettings(value) {
+    if (!isRecord(value))
+        throw new Error("settings must be an object");
+    const settings = { ...value };
+    if (value.jev !== undefined) {
+        validateJevSettings(value.jev);
+        settings.jev = value.jev;
+    }
+    return settings;
 }
 function parseClaudePlugins(value) {
     if (!Array.isArray(value)) {
@@ -970,11 +981,37 @@ function readRawConfigObject(filePath) {
         return {};
     }
 }
+function writeConfigText(writePath, text) {
+    let mode;
+    try {
+        writePath = realpathSync(writePath);
+        mode = statSync(writePath).mode & 0o777;
+    }
+    catch { }
+    mkdirSync(dirname(writePath), { recursive: true });
+    const tmpPath = `${writePath}.${process.pid}.tmp`;
+    rmSync(tmpPath, { force: true });
+    try {
+        writeFileSync(tmpPath, text, mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
+        if (mode !== undefined)
+            chmodSync(tmpPath, mode);
+        renameSync(tmpPath, writePath);
+    }
+    catch (error) {
+        try {
+            rmSync(tmpPath, { force: true });
+        }
+        catch { }
+        throw error;
+    }
+}
 function writeRawConfigObject(filePath, raw) {
-    mkdirSync(dirname(filePath), { recursive: true });
-    const tmpPath = `${filePath}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, `${JSON.stringify(raw, null, 2)}\n`, "utf-8");
-    renameSync(tmpPath, filePath);
+    writeConfigText(filePath, `${JSON.stringify(raw, null, 2)}\n`);
+}
+export function writeSharedConfigText(filePath, text) {
+    if (!isRecord(parseJsonWithComments(text)))
+        throw new Error("top-level value must be an object");
+    writeConfigText(filePath, text);
 }
 function getServersObject(raw) {
     const existing = raw.mcpServers ?? raw["mcp-servers"] ?? {};

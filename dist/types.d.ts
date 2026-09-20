@@ -370,6 +370,7 @@ export interface McpToolApprovalRequest {
     signal?: AbortSignal;
     claim(handler: McpToolApprovalHandler): boolean;
 }
+export type { JevAnswer, JevErrorCode, JevEvaluateInput, JevEvaluationData, JevEvaluationEnvelope, JevJson, JevQuestion } from "./jev-contracts.ts";
 export interface McpSettings {
     toolPrefix?: ToolPrefix;
     /** Show the plug prefix in MCP status and connection text (default: true). Set to false to disable it. */
@@ -403,6 +404,25 @@ export interface McpSettings {
     warnOnLargeDirectTools?: boolean;
     /** Register the trusted MCP-only JavaScript scripting tool. Defaults to true; set false to hide it. */
     scriptMode?: boolean;
+    /** Optional TypeSafe Jev integrations. Both features are disabled by default. */
+    jev?: false | {
+        semanticSearch?: boolean;
+        scriptEvaluation?: boolean;
+        /** Explicit allowlist for MCP-derived metadata/results sent to TypeSafe. */
+        allowedServers?: string[];
+        model?: string;
+        requestTimeoutMs?: number;
+        maxRetries?: number;
+        maxStateBytes?: number;
+        maxQuestionsPerRequest?: number;
+        maxEvaluationsPerScript?: number;
+        maxEvaluationBytesPerScript?: number;
+        /** Cumulative provider-reported input plus output tokens per script. Defaults to 32768. */
+        maxEvaluationTokensPerScript?: number;
+        /** Maximum semantic candidates per request. Defaults to 127; range 2..127. */
+        semanticCandidateLimit?: number;
+        semanticMinProbability?: number;
+    };
     /** Render MCP tool results as compact self-rendered rows by default, or as the legacy boxed row. */
     toolResultRendering?: "compact" | "boxed";
     /** Number of result text lines to show before expansion. Supports 1, 2, or 3. Defaults to 1 in compact mode and 3 in boxed mode. */
@@ -568,6 +588,11 @@ export declare function getServerPrefix(serverName: string, mode: ToolPrefix): s
  */
 export declare function formatToolName(toolName: string, serverName: string, prefix: ToolPrefix): string;
 export declare function resolveToolPrefix(definition?: Pick<ServerEntry, "toolPrefix">, globalPrefix?: ToolPrefix): ToolPrefix;
+/** A canonical name has an owner only when exactly one eligible entry produces it. */
+export declare function resolveUniqueNameOwnership<T>(entries: readonly T[], getName: (entry: T) => string): {
+    unique: T[];
+    collisions: Map<string, T[]>;
+};
 /**
  * Resolve a configured MCP server name from a prefixed tool name.
  *
