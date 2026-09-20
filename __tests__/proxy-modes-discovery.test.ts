@@ -130,13 +130,45 @@ describe("proxy discovery", () => {
 
   it("finds tools through configured search keywords", () => {
     const state = createState();
-    state.config.mcpServers.demo!.searchKeywords = { find: ["zzalias finder"] };
+    state.config.mcpServers.demo!.searchKeywords = { find: ["zzalias finder", "天气预报"] };
 
     expect(executeSearch(createState(), "zzalias").details).toMatchObject({ count: 0 });
     expect(executeSearch(state, "zzalias").details).toMatchObject({
       count: 1,
       matches: [{ server: "demo", tool: "demo_find", score: expect.any(Number) }],
     });
+    expect(executeSearch(state, "天气预报").details).toMatchObject({ count: 1, matches: [{ tool: "demo_find" }] });
+  });
+
+  it("matches useful CJK sentence terms while rejecting unrelated text", () => {
+    const state = createState();
+    state.toolMetadata.set("demo", [{
+      name: "demo_calendar",
+      originalName: "calendar",
+      description: "创建和管理日历事件",
+    }]);
+
+    expect(executeSearch(state, "创建日历事件").details).toMatchObject({ count: 1, matches: [{ tool: "demo_calendar" }] });
+    expect(executeSearch(state, "查询天气预报").details).toMatchObject({ count: 0, matches: [] });
+  });
+
+  it("matches adjacent CJK and ASCII terms without separators", () => {
+    const state = createState();
+    state.toolMetadata.set("demo", [
+      {
+        name: "demo_bilingual_calendar",
+        originalName: "bilingual_calendar",
+        description: "Manage calendar and 日历事件",
+      },
+      {
+        name: "demo_ascii_calendar",
+        originalName: "ascii_calendar",
+        description: "Manage calendar records",
+      },
+    ]);
+
+    expect(executeSearch(state, "calendar日历").details)
+      .toMatchObject({ count: 1, matches: [{ tool: "demo_bilingual_calendar" }] });
   });
 
   it("matches keyword keys by prefixed name and glob", () => {
