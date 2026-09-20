@@ -410,7 +410,11 @@ describe("proxy discovery", () => {
 
     const result = await executeCall(state, "codegraph_explore", { query: "identity provider" }, "codegraph");
 
-    expect(result.details).toMatchObject({ server: "codegraph", tool: "codegraph_explore" });
+    expect(result.details).toMatchObject({
+      server: "codegraph",
+      tool: "codegraph_explore",
+      canonicalTool: "codegraph_codegraph_explore",
+    });
     expect(result.details).not.toMatchObject({ error: "tool_not_found" });
     expect(callTool).toHaveBeenCalledWith(
       { name: "codegraph_explore", arguments: { query: "identity provider" }, _meta: undefined },
@@ -418,7 +422,7 @@ describe("proxy discovery", () => {
     );
   });
 
-  it("fails closed for same-server displayed and raw exact-name collisions", async () => {
+  it("gives an exact canonical name precedence over a same-server alias", async () => {
     const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "called" }] }));
     const state = {
       config: { mcpServers: { demo: { command: "demo" } } },
@@ -439,17 +443,128 @@ describe("proxy discovery", () => {
     } as unknown as McpExtensionState;
 
     expect(executeDescribe(state, "demo_search", "demo").details).toMatchObject({
-      error: "ambiguous_tool",
       server: "demo",
+      tool: { originalName: "search" },
     });
     await expect(executeCall(state, "demo_search", {}, "demo")).resolves.toMatchObject({
-      details: { error: "ambiguous_tool", server: "demo" },
+      details: { server: "demo", tool: "search", canonicalTool: "demo_search" },
     });
-    expect(callTool).not.toHaveBeenCalled();
+    expect(callTool).toHaveBeenCalledWith(
+      { name: "search", arguments: {}, _meta: undefined },
+      undefined,
+    );
 
     expect(executeDescribe(state, "demo_search").details).toMatchObject({
       server: "demo",
       tool: { originalName: "search" },
+    });
+  });
+
+  it("fails closed when a bare candidate alias is globally ambiguous", async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "called" }] }));
+    const state = {
+      config: { mcpServers: { first: { command: "first" }, second: { command: "second" } } },
+      toolMetadata: new Map([
+        ["first", [{ name: "first_search", originalName: "search", description: "First" }]],
+        ["second", [{ name: "second_search", originalName: "search", description: "Second" }]],
+      ]),
+      manager: { getConnection: () => ({ status: "connected", client: { callTool } }) },
+      failureTracker: new Map(),
+    } as unknown as McpExtensionState;
+
+    await expect(executeCall(state, "search", {})).resolves.toMatchObject({
+      details: { error: "ambiguous_tool", requestedTool: "search" },
+    });
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("gives a global exact canonical name precedence over another server's alias", async () => {
+    const exactCall = vi.fn(async () => ({ content: [{ type: "text", text: "exact" }] }));
+    const aliasCall = vi.fn();
+    const state = {
+      config: { mcpServers: { demo: { command: "demo" }, other: { command: "other" } } },
+      toolMetadata: new Map([
+        ["demo", [{ name: "demo_search", originalName: "search", description: "Exact" }]],
+        ["other", [{ name: "other_demo_search", originalName: "demo_search", description: "Alias" }]],
+      ]),
+      manager: {
+        getConnection: (server: string) => ({
+          status: "connected",
+          client: { callTool: server === "demo" ? exactCall : aliasCall },
+        }),
+        getRequestOptions: () => undefined,
+        touch: vi.fn(),
+        incrementInFlight: vi.fn(),
+        decrementInFlight: vi.fn(),
+      },
+      failureTracker: new Map(),
+      completedUiSessions: [],
+    } as unknown as McpExtensionState;
+
+    await expect(executeCall(state, "demo_search", {})).resolves.toMatchObject({
+      details: { server: "demo", tool: "search", canonicalTool: "demo_search" },
+    });
+    expect(exactCall).toHaveBeenCalledOnce();
+    expect(aliasCall).not.toHaveBeenCalled();
+  });
+
+  it("gives a global exact upstream name precedence over another server's prefix", async () => {
+    const exactCall = vi.fn(async () => ({ content: [{ type: "text", text: "exact" }] }));
+    const state = {
+      config: { mcpServers: { foo: { command: "foo" }, other: { command: "other" } } },
+      toolMetadata: new Map([
+        ["foo", [{ name: "foo_unrelated", originalName: "unrelated", description: "Unrelated" }]],
+        ["other", [{ name: "other_foo_bar", originalName: "foo_bar", description: "Exact" }]],
+      ]),
+      manager: {
+        getConnection: () => ({ status: "connected", client: { callTool: exactCall } }),
+        getRequestOptions: () => undefined,
+        touch: vi.fn(),
+        incrementInFlight: vi.fn(),
+        decrementInFlight: vi.fn(),
+      },
+      failureTracker: new Map(),
+      completedUiSessions: [],
+    } as unknown as McpExtensionState;
+
+    await expect(executeCall(state, "foo_bar", {})).resolves.toMatchObject({
+      details: { server: "other", tool: "foo_bar", canonicalTool: "other_foo_bar" },
+    });
+    expect(executeDescribe(state, "foo_bar").details).toMatchObject({
+      server: "other",
+      tool: { originalName: "foo_bar" },
+    });
+    expect(exactCall).toHaveBeenCalledWith({ name: "foo_bar", arguments: {}, _meta: undefined }, undefined);
+  });
+
+  it("ignores lower-tier and unavailable ambiguities when describing an exact upstream owner", () => {
+    const exact = { name: "other_foo__bar", originalName: "foo__bar", description: "Exact" };
+    const collisions = [
+      { name: "foo--bar", originalName: "first", description: "First" },
+      { name: "foo-_bar", originalName: "second", description: "Second" },
+    ];
+    const state = {
+      config: {
+        mcpServers: {
+          other: { command: "other" },
+          lower: { command: "lower" },
+          disabled: { command: "disabled", enabled: false },
+          failed: { command: "failed" },
+        },
+      },
+      toolMetadata: new Map([
+        ["other", [exact]],
+        ["lower", collisions],
+        ["disabled", collisions],
+        ["failed", collisions],
+      ]),
+      manager: { getConnection: () => undefined },
+      failureTracker: new Map([["failed", Date.now()]]),
+    } as unknown as McpExtensionState;
+
+    expect(executeDescribe(state, "foo__bar").details).toMatchObject({
+      server: "other",
+      tool: { originalName: "foo__bar" },
     });
   });
 

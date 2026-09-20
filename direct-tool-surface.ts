@@ -1,6 +1,6 @@
 import { Check, Errors } from "typebox/value";
 import type { DirectToolSpec, McpConfig, ToolPrefix } from "./types.ts";
-import { createToolSelectorCandidateIndex, formatToolName, getToolNameCandidates, isServerDisabled, isToolAllowed, resolveToolPrefix } from "./types.ts";
+import { createToolSelectorCandidateIndex, formatToolName, getToolNameCandidates, isServerDisabled, isToolAllowed, resolveToolPrefix, resolveUniqueNameOwnership } from "./types.ts";
 import type { MetadataCache } from "./metadata-cache.ts";
 import { isServerCacheValid, parseDirectToolSelectors } from "./metadata-cache.ts";
 export { getMissingConfiguredDirectToolServers } from "./metadata-cache.ts";
@@ -73,8 +73,6 @@ export function resolveDirectTools(
   const specs: DirectToolSpec[] = [];
   if (!cache) return specs;
 
-  const seenNames = new Set<string>();
-
   const envSelection = envOverride ? parseDirectToolSelectors(envOverride) : null;
   const globalDirect = config.settings?.directTools;
 
@@ -139,11 +137,6 @@ export function resolveDirectTools(
         console.warn(`MCP: skipping direct tool "${prefixedName}" (collides with builtin)`);
         continue;
       }
-      if (seenNames.has(prefixedName)) {
-        console.warn(`MCP: skipping duplicate direct tool "${prefixedName}" from "${serverName}"`);
-        continue;
-      }
-      seenNames.add(prefixedName);
       specs.push({
         ...(lazy ? { lazy: true } : {}),
         serverName,
@@ -166,11 +159,6 @@ export function resolveDirectTools(
           console.warn(`MCP: skipping direct resource tool "${prefixedName}" (collides with builtin)`);
           continue;
         }
-        if (seenNames.has(prefixedName)) {
-          console.warn(`MCP: skipping duplicate direct resource tool "${prefixedName}" from "${serverName}"`);
-          continue;
-        }
-        seenNames.add(prefixedName);
         specs.push({
           ...(lazy ? { lazy: true } : {}),
           serverName,
@@ -183,11 +171,16 @@ export function resolveDirectTools(
     }
   }
 
-  for (const spec of specs) reservedNames?.add(spec.prefixedName);
+  const ownership = resolveUniqueNameOwnership(specs, (spec) => spec.prefixedName);
+  for (const [name, colliding] of ownership.collisions) {
+    console.warn(`MCP: skipping colliding direct name "${name}" from ${colliding.map((spec) => `"${spec.serverName}"`).join(", ")}`);
+  }
+  const uniqueSpecs = ownership.unique;
+  for (const spec of uniqueSpecs) reservedNames?.add(spec.prefixedName);
 
   const emittedSpecs = unavailableServers.size === 0
-    ? specs
-    : specs.filter((spec) => !unavailableServers.has(spec.serverName));
+    ? uniqueSpecs
+    : uniqueSpecs.filter((spec) => !unavailableServers.has(spec.serverName));
 
   // Lazy specs cost nothing at turn start, so they do not count toward the advisory.
   const eagerCount = emittedSpecs.filter((spec) => !spec.lazy).length;
