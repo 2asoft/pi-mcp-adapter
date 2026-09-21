@@ -12,6 +12,16 @@ const DEFAULTS = {
 };
 const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const hosts = new WeakMap();
+const credentials = new WeakMap();
+function resolveCredential(state) {
+    const existing = credentials.get(state);
+    if (existing)
+        return existing;
+    const credential = resolveJevCredential();
+    if (credential.status === "present")
+        credentials.set(state, credential);
+    return credential;
+}
 export function areJevSourcesAllowed(state, settings, sources) {
     for (const source of sources) {
         const server = state.config.mcpServers[source];
@@ -50,7 +60,7 @@ export function validateJevSettings(value) {
     for (const key of Object.keys(input))
         if (!allowed.has(key))
             throw new Error(`settings.jev.${key} is not supported`);
-    if (input.allowedServers !== undefined && (!Array.isArray(input.allowedServers) || input.allowedServers.some(name => typeof name !== "string" || name.length === 0 || name.length > 128 || DANGEROUS_KEYS.has(name)))) {
+    if (input.allowedServers !== undefined && (!Array.isArray(input.allowedServers) || input.allowedServers.some(name => typeof name !== "string" || name.length === 0 || DANGEROUS_KEYS.has(name) || /[\u0000-\u001f\u007f]/.test(name)))) {
         throw new Error("settings.jev.allowedServers must contain non-empty safe server names");
     }
     const model = input.model ?? DEFAULTS.model;
@@ -73,6 +83,18 @@ export function validateJevSettings(value) {
         semanticCandidateLimit: integer(input.semanticCandidateLimit, DEFAULTS.semanticCandidateLimit, 2, 127, "settings.jev.semanticCandidateLimit"),
         semanticMinProbability: probability,
     };
+}
+export function resolveSemanticJevSettings(state, credentialResolver) {
+    const configured = state.config.settings?.jev;
+    const settings = validateJevSettings(configured);
+    if (configured === false || configured?.semanticSearch === false)
+        return settings;
+    const semanticSearch = settings.semanticSearch || (credentialResolver ? credentialResolver() : resolveCredential(state)).status === "present";
+    const hasExplicitAllowlist = configured !== undefined && Object.hasOwn(configured, "allowedServers");
+    const allowedServers = hasExplicitAllowlist
+        ? settings.allowedServers
+        : Object.keys(state.config.mcpServers).filter((name) => !isServerDisabled(state.config.mcpServers[name]));
+    return { ...settings, semanticSearch, allowedServers };
 }
 function validateJson(value, path, seen = new Set()) {
     if (value === null || typeof value === "string" || typeof value === "boolean")
@@ -104,6 +126,10 @@ function validateJson(value, path, seen = new Set()) {
 function validateId(id, label) {
     if (id.length === 0 || id.length > 128 || DANGEROUS_KEYS.has(id) || /[\u0000-\u001f\u007f]/.test(id))
         throw new Error(`${label} contains an invalid identifier`);
+}
+function validateSource(source) {
+    if (source.length === 0 || DANGEROUS_KEYS.has(source) || /[\u0000-\u001f\u007f]/.test(source))
+        throw new Error("sources contains an invalid server name");
 }
 function exactKeys(value, allowed, label) {
     if (Object.keys(value).some(key => !allowed.includes(key)))
@@ -160,7 +186,7 @@ export function validateJevEvaluateInput(value, limits) {
         if (!Array.isArray(input.sources))
             throw new Error("sources must be an array");
         sources = input.sources.map((source, index) => { if (typeof source !== "string")
-            throw new Error(`sources[${index}] must be a string`); validateId(source, "sources"); return source; });
+            throw new Error(`sources[${index}] must be a string`); validateSource(source); return source; });
         if (new Set(sources).size !== sources.length)
             throw new Error("sources must not contain duplicates");
     }
@@ -240,7 +266,7 @@ function getHost(state, settings) {
     const existing = hosts.get(state);
     if (existing)
         return existing;
-    const credential = resolveJevCredential();
+    const credential = resolveCredential(state);
     if (credential.status === "missing")
         return { ok: false, error: { code: "credential_missing", message: "TypeSafe API key is not configured." } };
     if (credential.status === "unavailable")
@@ -273,7 +299,7 @@ export async function evaluateJev(state, value, options) {
     let settings;
     let input;
     try {
-        settings = validateJevSettings(state.config.settings?.jev);
+        settings = options.purpose === "semantic-search" ? resolveSemanticJevSettings(state) : validateJevSettings(state.config.settings?.jev);
         input = validateJevEvaluateInput(value, settings);
     }
     catch {
