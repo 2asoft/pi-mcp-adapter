@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.35.0] - 2026-09-20
+
+### Highlights
+
+- Describe what you want to do and let Jev find the MCP tools that best match your request.
+- Run long-lived MCP Tasks with progress polling, interactive input, and cancellation.
+- Edit shared MCP configuration without leaving Pi and approve a server for the rest of the session.
+- Reconnect to OAuth and bearer-token servers more reliably, including after expired credentials or authorization failures.
+- Find and use tools more accurately across CJK queries, namespaced catalogs, structured results, and ambiguous names.
+
 ### Added
 
-- Added opt-in TypeSafe Jev semantic tool search and host-mediated `jev.evaluate` for `mcpScript`, with secure OS-keyring credentials, fixed-origin bounded requests, explicit data-egress policy, examples, and metadata-only traces. Jev can understand a request and rank MCP tools by how well they match it. In a live test across 95 local tools and resources, it chose the expected result first in 10 of 11 answerable cases and second once, compared with 5 first-place matches from regular text search. Part of [#611](https://github.com/nicobailon/pi-mcp-adapter/issues/611). Thanks to [@nicobailon](https://github.com/nicobailon).
+- Opt-in TypeSafe Jev support can understand a request, rank MCP tools by how well they match, and evaluate intermediate `mcpScript` results. Credentials stay in the OS keyring or environment, sharing MCP data requires an explicit server allowlist, and requests have configurable limits. In a live test across 95 local tools and resources, Jev chose the expected result first in 10 of 11 answerable cases and second once, compared with 5 first-place matches from regular text search. Part of [#611](https://github.com/nicobailon/pi-mcp-adapter/issues/611).
 - `/mcp edit [project|global]` opens the shared MCP config in an editor (Ctrl+G opens `$EDITOR`), refuses text that is not a JSONC object, and reloads after a save. Closes #593. Thanks to [@turisanapo](https://github.com/turisanapo) for PR #594.
-- Support for the MCP Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663). Tool calls that return a task handle are transparently polled to completion, task-time elicitation is routed through the normal elicitation UI and answered via `tasks/update`, aborting a call sends a cooperative `tasks/cancel`, and failed tasks surface as the typed JSON-RPC error a synchronous call would have produced. Built on `@modelcontextprotocol/ext-tasks`; active only when a 2026-07-28 connection's server advertises the extension, with a per-server `tasks: false` opt-out. Thanks to [@rgarcia](https://github.com/rgarcia) for PR #620.
+- Support for MCP Tasks. Long-running tool calls are polled to completion, interactive questions use the normal Pi interface, cancellation is forwarded to the server, and failures are reported like ordinary tool-call errors. Task support activates only when the server advertises it and can be disabled per server with `tasks: false`. Thanks to [@rgarcia](https://github.com/rgarcia) for PR #620.
 - Users can grant runtime-only approval for all tools and arguments on a server for the current session. Thanks to [@derdossi](https://github.com/derdossi) for PR #618.
 
 ### Changed
