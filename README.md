@@ -592,7 +592,21 @@ Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — t
 
 #### Jev semantic search and opt-in script evaluation
 
-Semantic search turns on automatically when a valid TypeSafe key is available and considers tools from every enabled MCP server by default. Regular searches remain local; TypeSafe receives data only when semantic search is requested. Script evaluation remains disabled until `scriptEvaluation: true` is configured. Requests use pinned model `jev-1.13.0` at the fixed origin `https://api.typesafe.ai`. Review TypeSafe's current [legal terms](https://docs.typesafe.ai/legal), including privacy and retention; a no-training commitment does not mean zero retention.
+A valid TypeSafe key makes semantic search available across every enabled MCP server; it does not run Jev searches automatically. A search uses Jev only when `searchMode: "semantic"` is explicitly requested. Jev ranks matching tools but never executes them. Script evaluation remains disabled until `scriptEvaluation: true` is configured. Requests use pinned model `jev-1.13.0` at the fixed origin `https://api.typesafe.ai`. Review TypeSafe's current [legal terms](https://docs.typesafe.ai/legal), including privacy and retention; a no-training commitment does not mean zero retention.
+
+```text
+Normal search
+mcp({ search: "calendar" })
+        │
+        └── local lexical search
+            no Jev request
+
+Explicit semantic search
+mcp({ search: "calendar", searchMode: "semantic" })
+        │
+        └── Jev ranks matching tools
+            no tool is executed
+```
 
 The quickest desktop setup is:
 
@@ -618,7 +632,7 @@ Semantic search sends the query text, server names, normalized and original tool
 }
 ```
 
-Request semantic discovery with `mcp({ search: "triage customer reports", searchMode: "semantic" })` or `tools.search({ query: "triage customer reports", searchMode: "semantic" })`. Regex is incompatible. Timeout, rate-limit, and service failures return marked lexical fallback; credential, policy, configuration, and response failures do not. If no allowed server has cached tools, search explains how to connect a server or update the allowlist; if Jev decides no tool fits, the result says that Jev abstained.
+Request semantic discovery explicitly with `mcp({ search: "triage customer reports", searchMode: "semantic" })` or `tools.search({ query: "triage customer reports", searchMode: "semantic" })`. Regex is incompatible. Timeout, rate-limit, and service failures return marked lexical fallback; credential, policy, configuration, and response failures do not. If no allowed server has cached tools, search explains how to connect a server or update the allowlist; if Jev decides no tool fits, the result says that Jev abstained.
 
 Optional `jev` controls bound timeout/retries, request and script budgets, semantic candidates (at most 127), and minimum probability. The cumulative token budget uses provider-reported input plus output usage. Exact pre-response admission is unavailable without the provider tokenizer, so byte/question/state limits bound requests before dispatch; a response that exceeds the remaining token budget is discarded and exhausts it. The endpoint, headers, and SDK logging are not configurable.
 
