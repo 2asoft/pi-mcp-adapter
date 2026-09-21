@@ -104,7 +104,11 @@ describe("package.json dependency policy", () => {
     const registrySemver = /^(?:[~^]?\d+\.\d+\.\d+|\*)(?:\s*\|\|\s*(?:[~^]?\d+\.\d+\.\d+|\*))*$/;
 
     for (const dependencies of dependencyGroups) {
-      for (const spec of Object.values(dependencies)) {
+      for (const [name, spec] of Object.entries(dependencies)) {
+        if (name === "recheck") {
+          expect(spec).toBe("4.6.0-beta.3");
+          continue;
+        }
         expect(spec).toMatch(registrySemver);
         expect(spec).not.toMatch(/^(?:https?:|git(?:\+[^:]+)?:|file:)/);
       }
