@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A valid TypeSafe key now enables semantic search across every enabled MCP tool by default, while script evaluation remains opt-in. Search also explains when an explicit allowlist permits no servers, when allowed servers have no cached tools, and when Jev decides that none of the available tools fit the request.
 
+### Fixed
+
+- Windows contributors can run `npm test` again; the runner now launches npm through `cross-spawn` so hardened Node versions can execute `npm.cmd`. Thanks @insuffer for the fix.
+
 ## [2.35.0] - 2026-09-20
 
 ### Highlights
