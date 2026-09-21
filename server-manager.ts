@@ -266,6 +266,8 @@ export class McpServerManager {
   private connectPromises = new Map<string, Promise<ServerConnection>>();
   private connectOAuthAuthorities = new Map<string, OAuthAuthority>();
   private reconnectPromises = new Map<string, Promise<ServerConnection>>();
+  private reconnectOAuthAuthorities = new Map<string, OAuthAuthority>();
+  private reconnectAttempts = new Map<string, AbortController>();
   private uiStreamListeners = new Map<string, UiStreamListener>();
   private samplingConfig: ServerSamplingConfig | undefined;
   private metadataListChangedListener: MetadataListChangedListener | undefined;
@@ -379,6 +381,36 @@ export class McpServerManager {
     };
   }
 
+  private arbitrateConnectionAttempt(
+    name: string,
+    oauthAuthority: OAuthAuthority | undefined,
+    promises: Map<string, Promise<ServerConnection>>,
+    authorities: Map<string, OAuthAuthority>,
+    attempts: Map<string, AbortController>,
+  ): Promise<ServerConnection> | undefined {
+    const existingPromise = promises.get(name);
+    if (!existingPromise) return undefined;
+
+    const existingAuthority = authorities.get(name);
+    let reusable = oauthAuthority === undefined && existingAuthority === undefined;
+    if (oauthAuthority && existingAuthority) {
+      try {
+        existingAuthority();
+        reusable = true;
+      } catch {
+        reusable = false;
+      }
+    }
+    if (reusable) return existingPromise;
+
+    const replacedAttempt = attempts.get(name);
+    replacedAttempt?.abort(new Error(`MCP connection ${name} was replaced`));
+    if (attempts.get(name) === replacedAttempt) attempts.delete(name);
+    if (promises.get(name) === existingPromise) promises.delete(name);
+    if (authorities.get(name) === existingAuthority) authorities.delete(name);
+    return undefined;
+  }
+
   async connect(name: string, definition: ServerDefinition, signal?: AbortSignal): Promise<ServerConnection> {
     validateCaFile(definition);
     if (isServerDisabled(definition)) throw new Error(`MCP server "${name}" is disabled`);
@@ -393,33 +425,32 @@ export class McpServerManager {
     throwIfAborted(ownedSignal);
 
     // Dedupe concurrent connection attempts.
-    const existingConnect = this.connectPromises.get(name);
-    if (existingConnect) {
-      const existingAuthority = this.connectOAuthAuthorities.get(name);
-      let reusable = oauthAuthority === undefined && existingAuthority === undefined;
-      if (oauthAuthority && existingAuthority) {
-        try {
-          existingAuthority();
-          reusable = true;
-        } catch {
-          reusable = false;
-        }
-      }
-      if (reusable) return abortable(existingConnect, ownedSignal);
-      const replacedAttempt = this.connectAttempts.get(name);
-      replacedAttempt?.abort(new Error(`MCP connection ${name} was replaced`));
-      if (this.connectAttempts.get(name) === replacedAttempt) this.connectAttempts.delete(name);
-      if (this.connectPromises.get(name) === existingConnect) this.connectPromises.delete(name);
-      if (this.connectOAuthAuthorities.get(name) === existingAuthority) {
-        this.connectOAuthAuthorities.delete(name);
-      }
-    }
+    const existingConnect = this.arbitrateConnectionAttempt(
+      name,
+      oauthAuthority,
+      this.connectPromises,
+      this.connectOAuthAuthorities,
+      this.connectAttempts,
+    );
+    if (existingConnect) return abortable(existingConnect, ownedSignal);
 
     const existing = this.connections.get(name);
     if (existing?.status === "connected") {
       existing.lastUsedAt = Date.now();
       return existing;
     }
+
+    // A needs-auth route can be retried through either public path. Share an
+    // authority-compatible reconnect candidate instead of creating a second
+    // owner for the same server.
+    const existingReconnect = this.arbitrateConnectionAttempt(
+      name,
+      oauthAuthority,
+      this.reconnectPromises,
+      this.reconnectOAuthAuthorities,
+      this.reconnectAttempts,
+    );
+    if (existingReconnect) return abortable(existingReconnect, ownedSignal);
 
     const credentialsInvalidated = existing?.status === "needs-auth"
       && existing.credentialsInvalidated === true;
@@ -479,21 +510,63 @@ export class McpServerManager {
     staleConnection: ServerConnection,
     signal?: AbortSignal,
   ): Promise<ServerConnection> {
+    validateCaFile(definition);
     if (isServerDisabled(definition)) throw new Error(`MCP server "${name}" is disabled`);
     if (this.stopped) throw new Error("MCP server manager is closed");
     const ownedSignal = combineAbortSignals(this.runtimeSignal, signal);
     throwIfAborted(ownedSignal);
-    const inFlight = this.reconnectPromises.get(name);
-    if (inFlight) {
-      return abortable(inFlight, ownedSignal);
-    }
+    const oauthAuthority = definition.url && supportsOAuth(definition)
+      ? captureOAuthAuthority(name, false)
+      : undefined;
+    // connect() and reconnect() are interchangeable retry entry points for a
+    // published needs-auth route. They must not create competing OAuth owners.
+    const existingConnect = this.arbitrateConnectionAttempt(
+      name,
+      oauthAuthority,
+      this.connectPromises,
+      this.connectOAuthAuthorities,
+      this.connectAttempts,
+    );
+    if (existingConnect) return abortable(existingConnect, ownedSignal);
+    const inFlight = this.arbitrateConnectionAttempt(
+      name,
+      oauthAuthority,
+      this.reconnectPromises,
+      this.reconnectOAuthAuthorities,
+      this.reconnectAttempts,
+    );
+    if (inFlight) return abortable(inFlight, ownedSignal);
 
-    const promise = this.doReconnect(name, definition, staleConnection, ownedSignal).finally(() => {
-      if (this.reconnectPromises.get(name) === promise) {
-        this.reconnectPromises.delete(name);
-      }
-    });
+    const attemptController = new AbortController();
+    const attemptSignal = combineAbortSignals(ownedSignal, attemptController.signal);
+    const promise = this.doReconnect(
+      name,
+      definition,
+      staleConnection,
+      attemptSignal,
+      oauthAuthority,
+      attemptController,
+    )
+      .catch(error => {
+        if (attemptController.signal.aborted && !this.containsCleanupFailure(error)) {
+          throw new Error(`MCP connection for ${name} was closed while reconnecting`, { cause: error });
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (this.reconnectPromises.get(name) === promise) {
+          this.reconnectPromises.delete(name);
+        }
+        if (this.reconnectAttempts.get(name) === attemptController) {
+          this.reconnectAttempts.delete(name);
+        }
+        if (this.reconnectOAuthAuthorities.get(name) === oauthAuthority) {
+          this.reconnectOAuthAuthorities.delete(name);
+        }
+      });
     this.reconnectPromises.set(name, promise);
+    if (oauthAuthority) this.reconnectOAuthAuthorities.set(name, oauthAuthority);
+    this.reconnectAttempts.set(name, attemptController);
     return abortable(promise, ownedSignal);
   }
 
@@ -858,6 +931,8 @@ export class McpServerManager {
     definition: ServerDefinition,
     staleConnection: ServerConnection,
     signal?: AbortSignal,
+    oauthAuthority?: OAuthAuthority,
+    attemptOwner?: AbortController,
   ): Promise<ServerConnection> {
     throwIfAborted(signal);
     const current = this.connections.get(name);
@@ -869,10 +944,68 @@ export class McpServerManager {
       return current ?? this.connect(name, definition, signal);
     }
 
-    const staleInFlight = staleConnection.inFlight;
-    await this.close(name);
-    const fresh = await this.connect(name, definition, signal);
-    fresh.inFlight = Math.max(fresh.inFlight, staleInFlight);
+    // Build the replacement privately. The current route remains usable until
+    // the candidate has completed its handshake and metadata discovery. A
+    // failed candidate therefore cannot remove or close the last good route.
+    const generation = this.closeGenerations.get(name) ?? 0;
+    const credentialsInvalidated = staleConnection.status === "needs-auth"
+      && staleConnection.credentialsInvalidated === true;
+    const candidateAttempt = this.createConnection(
+      name,
+      definition,
+      signal,
+      signal,
+      credentialsInvalidated,
+      oauthAuthority,
+      attemptOwner,
+    );
+    const fresh = definition.url
+      ? await candidateAttempt.catch(async error => { throw await this.enrichHttpConnectionError(definition, error); })
+      : await candidateAttempt;
+
+    // An explicit close or a concurrent replacement supersedes this candidate.
+    // Dispose only the candidate we own; never close whichever route is now
+    // registered under the shared server name.
+    if (signal?.aborted
+      || this.reconnectAttempts.get(name) !== attemptOwner
+      || (this.closeGenerations.get(name) ?? 0) !== generation) {
+      await this.disposeConnection(fresh);
+      throwIfAborted(signal);
+      throw new Error(`MCP connection for ${name} was closed while reconnecting`);
+    }
+    const routeAtPublish = this.connections.get(name);
+    if (routeAtPublish !== staleConnection) {
+      await this.disposeConnection(fresh);
+      return routeAtPublish ?? this.connect(name, definition, signal);
+    }
+
+    fresh.inFlight = Math.max(fresh.inFlight, staleConnection.inFlight);
+    this.connections.set(name, fresh);
+    this.watchListenSubscription(name, fresh, fresh.listenSubscription);
+    if ([...this.resourceUpdatedListeners.values()].some(registration => registration.serverName === name)) {
+      void this.ensureListen(name, fresh);
+    }
+
+    // Publish first so calls route to the fresh image while the exact displaced
+    // child is terminated and reaped. Late close callbacks are identity-guarded.
+    staleConnection.status = "closed";
+    try {
+      await this.disposeConnection(staleConnection);
+    } catch (error) {
+      const failures = error instanceof AggregateError ? error.errors : [error];
+      const details = failures
+        .map(failure => failure instanceof Error ? failure.message : String(failure))
+        .join("; ");
+      logger.debug(`MCP: stale connection cleanup failed for ${name}: ${details}`);
+    }
+
+    // Publication is not permission to return a route that close() disposed
+    // while stale cleanup was pending.
+    if ((this.closeGenerations.get(name) ?? 0) !== generation
+      || this.connections.get(name) !== fresh
+      || fresh.status === "closed") {
+      throw new Error(`MCP connection for ${name} was closed while reconnecting`);
+    }
     return fresh;
   }
 
@@ -1426,8 +1559,10 @@ export class McpServerManager {
     let caFetch = createCaFetch(definition);
     try {
     const createAuthProvider = (): McpOAuthProvider => {
-      const currentAttempt = this.connectAttempts.get(serverName);
-      if (currentAttempt && currentAttempt !== attemptOwner) {
+      const currentConnectAttempt = this.connectAttempts.get(serverName);
+      const currentReconnectAttempt = this.reconnectAttempts.get(serverName);
+      if ((currentConnectAttempt && currentConnectAttempt !== attemptOwner)
+        || (currentReconnectAttempt && currentReconnectAttempt !== attemptOwner)) {
         throw new Error(`MCP connection for ${serverName} was replaced while connecting`);
       }
       if (!oauthAuthority) throw new Error(`Missing OAuth authority for ${serverName}`);
@@ -1770,8 +1905,10 @@ export class McpServerManager {
   async close(name: string): Promise<void> {
     this.closeGenerations.set(name, (this.closeGenerations.get(name) ?? 0) + 1);
     this.connectAttempts.get(name)?.abort(new Error(`MCP connection ${name} was closed`));
+    this.reconnectAttempts.get(name)?.abort(new Error(`MCP connection ${name} was closed`));
     this.pendingMetadataPublications.delete(name);
 
+    const pendingReconnect = this.reconnectPromises.get(name);
     const connection = this.connections.get(name);
     if (!connection) {
       const pendingClose = this.closePromises.get(name);
@@ -1780,9 +1917,10 @@ export class McpServerManager {
         return;
       }
       const pendingConnect = this.connectPromises.get(name);
-      if (pendingConnect) {
+      for (const pending of [pendingConnect, pendingReconnect]) {
+        if (!pending) continue;
         try {
-          await pendingConnect;
+          await pending;
         } catch (error) {
           if (this.containsCleanupFailure(error)) throw error;
         }
@@ -1799,7 +1937,14 @@ export class McpServerManager {
       if (this.closePromises.get(name) === closing) this.closePromises.delete(name);
     });
     this.closePromises.set(name, closing);
-    return closing;
+    await closing;
+    if (pendingReconnect) {
+      try {
+        await pendingReconnect;
+      } catch (error) {
+        if (this.containsCleanupFailure(error)) throw error;
+      }
+    }
   }
 
   private async disposeConnection(connection: ServerConnection): Promise<void> {
@@ -1819,13 +1964,18 @@ export class McpServerManager {
 
   async closeAll(): Promise<void> {
     this.stopped = true;
-    const names = new Set([...this.connections.keys(), ...this.connectPromises.keys()]);
+    const names = new Set([
+      ...this.connections.keys(),
+      ...this.connectPromises.keys(),
+      ...this.reconnectPromises.keys(),
+    ]);
     for (const name of names) {
       this.closeGenerations.set(name, (this.closeGenerations.get(name) ?? 0) + 1);
       this.connectAttempts.get(name)?.abort(new Error(`MCP connection ${name} was closed`));
+      this.reconnectAttempts.get(name)?.abort(new Error(`MCP connection ${name} was closed`));
     }
 
-    const pendingConnects = [...this.connectPromises.values()];
+    const pendingConnects = [...this.connectPromises.values(), ...this.reconnectPromises.values()];
     const currentNames = [...this.connections.keys()];
     const pendingResults = await Promise.allSettled(pendingConnects);
     const results = await Promise.allSettled(currentNames.map(name => this.close(name)));
