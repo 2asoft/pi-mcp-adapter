@@ -341,8 +341,6 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   const fallbackDeactivatedTools = new Set<string>();
   // directTools: "search" — registered inactive, activated by mcp({ search }).
   const lazyDirectTools = new Set<string>();
-  // The lazy tools a search has activated; every other lazy tool is held out
-  // of the active set. Per process: nothing here survives a restart.
   const searchActivatedTools = new Set<string>();
   const toolRenderOptions = resolveMcpToolRenderOptions(earlyConfig.settings);
   const toolRenderShell = toolRenderOptions.resultRendering === "compact" ? "self" : "default";
@@ -1081,6 +1079,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    // Reset before any await so replacement sessions cannot inherit activation.
+    searchActivatedTools.clear();
+    holdLazyToolsInactive();
     const generation = ++lifecycleGeneration;
     largeDirectToolsAdvisoryDelivered = false;
     const previousState = state;
@@ -1147,6 +1148,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     }
     await initializationStarted;
   });
+
+  // Other extensions can reactivate registered tools after session_start.
+  pi.on("before_agent_start", holdLazyToolsInactive);
 
   pi.on("session_tree", (_event, ctx) => {
     const currentState = state;
@@ -1947,6 +1951,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         }
         if (params.search !== undefined) {
           const result = await proxyModes.executeSearch(proxyState, params.search, params.regex, params.server, params.includeSchemas, params.limit, params.offset, params.searchMode, signal);
+          assertRuntimeGuard(proxyGuard);
           if (lazyDirectTools.size === 0) return result;
           holdLazyToolsInactive();
           const matches = (result.details as { matches?: Array<{ server: string; tool: string }> } | undefined)?.matches ?? [];
