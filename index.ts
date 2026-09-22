@@ -56,6 +56,39 @@ const INIT_WAIT_TIMEOUT_MS = 30_000;
 const INIT_FAILURE_MESSAGE_MAX_CHARS = 1_000;
 const INIT_WAIT_TIMED_OUT: unique symbol = Symbol("init-wait-timed-out");
 
+function getEnabledServersWithoutValidMetadata(config: McpConfig, cache: MetadataCache | null): string[] {
+  return Object.entries(config.mcpServers).flatMap(([serverName, definition]) => {
+    if (isServerDisabled(definition)) return [];
+    const entry = cache?.servers[serverName];
+    return entry === undefined || !isServerCacheValid(entry, definition) ? [serverName] : [];
+  });
+}
+
+function hasEnabledServerWithoutValidSurface(
+  config: McpConfig,
+  cache: MetadataCache | null,
+  directSpecs: readonly DirectToolSpec[],
+): boolean {
+  const directServers = new Set(directSpecs.map(({ serverName }) => serverName));
+  return getEnabledServersWithoutValidMetadata(config, cache)
+    .some((serverName) => !directServers.has(serverName));
+}
+
+function canDeferSessionRuntime(
+  config: McpConfig,
+  cache: MetadataCache | null,
+  hasColdEnvironmentDirectTools: boolean,
+): boolean {
+  const enabledServers = Object.entries(config.mcpServers)
+    .filter(([, definition]) => !isServerDisabled(definition));
+  if (enabledServers.some(([, definition]) => definition.lifecycle === "eager" || definition.lifecycle === "keep-alive")) {
+    return false;
+  }
+  if (hasColdEnvironmentDirectTools) return false;
+  return config.settings?.deferWithMissingMetadata === true
+    || (cache !== null && getEnabledServersWithoutValidMetadata(config, cache).length === 0);
+}
+
 export interface McpServerRegistration {
   dispose(): Promise<void>;
 }
@@ -320,17 +353,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   const envRaw = process.env.MCP_DIRECT_TOOLS;
   const envDirectToolOverride = parseEnvDirectToolOverride(envRaw);
   const namespaceEnvOverride = resolveNamespaceEnvOverride(envRaw, envDirectToolOverride);
-  const enabledEarlyServers = Object.entries(earlyConfig.mcpServers)
-    .filter(([, definition]) => !isServerDisabled(definition));
-  const hasStartupServer = enabledEarlyServers.some(([, definition]) =>
-    definition.lifecycle === "eager" || definition.lifecycle === "keep-alive");
-  const hasUsableCachedMetadata = earlyCache !== null && enabledEarlyServers.every(([serverName, definition]) => {
-    const entry = earlyCache.servers[serverName];
-    return entry !== undefined && isServerCacheValid(entry, definition);
-  });
-  const hasColdEnvironmentDirectTools = envRaw !== undefined && envRaw !== "__none__"
-    && getMissingConfiguredDirectToolServers(earlyConfig, earlyCache, envDirectToolOverride).length > 0;
-  const deferSessionRuntime = !hasStartupServer && hasUsableCachedMetadata && !hasColdEnvironmentDirectTools;
+  const hasStartupServer = Object.values(earlyConfig.mcpServers).some((definition) =>
+    !isServerDisabled(definition) && (definition.lifecycle === "eager" || definition.lifecycle === "keep-alive"));
   const registeredDirectTools = new Map<string, string>();
   const registeredDirectToolServers = new Map<string, string>();
   const registeredDirectToolVersions = new Map<string, number>();
@@ -655,7 +679,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
   function getDeferredSessionSnapshot(cwd: string | undefined): {
     config: McpConfig;
-    specs: DirectToolSpec[];
+    cache: MetadataCache | null;
     enabledServerCount: number;
   } | undefined {
     const config = programmaticConfig
@@ -664,18 +688,12 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     const cache = loadMetadataCache();
     const enabledServers = Object.entries(config.mcpServers)
       .filter(([, definition]) => !isServerDisabled(definition));
-    if (enabledServers.some(([, definition]) => definition.lifecycle === "eager" || definition.lifecycle === "keep-alive")) {
-      return undefined;
-    }
-    if (!cache || !enabledServers.every(([serverName, definition]) => {
-      const entry = cache.servers[serverName];
-      return entry !== undefined && isServerCacheValid(entry, definition);
-    })) return undefined;
-    if (envRaw !== undefined && envRaw !== "__none__"
-      && getMissingConfiguredDirectToolServers(config, cache, envDirectToolOverride).length > 0) return undefined;
+    const hasColdEnvironmentDirectTools = envRaw !== undefined && envRaw !== "__none__"
+      && getMissingConfiguredDirectToolServers(config, cache, envDirectToolOverride).length > 0;
+    if (!canDeferSessionRuntime(config, cache, hasColdEnvironmentDirectTools)) return undefined;
     return {
       config,
-      specs: resolveCurrentDirectTools(config, cache),
+      cache,
       enabledServerCount: enabledServers.length,
     };
   }
@@ -739,8 +757,6 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       .filter(([name]) => !state?.provisionalInstalls?.has(name))
       .flatMap(([, prompts]) => prompts));
   }
-
-  registerPromptCommands(resolveCachedPrompts(earlyConfig));
 
   const registerRuntimeServer = (name: string, definition: ServerEntry): McpServerRegistration => {
     if (typeof name !== "string" || name.trim() === "") {
@@ -1112,9 +1128,22 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     if (state) return;
 
     if (!initPromise) {
-      const deferredSnapshot = deferSessionRuntime ? getDeferredSessionSnapshot(ctx.cwd) : undefined;
+      const deferredSnapshot = getDeferredSessionSnapshot(ctx.cwd);
       if (deferredSnapshot) {
-        deliverLargeDirectToolsAdvisory(ctx, deferredSnapshot.config, deferredSnapshot.specs);
+        const directResult = syncDirectTools(deferredSnapshot.config, deferredSnapshot.cache);
+        syncProxyTool(deferredSnapshot.config, deferredSnapshot.cache, directResult.specs);
+        syncNamespaceTools(
+          deferredSnapshot.config,
+          deferredSnapshot.cache,
+          directResult.reservedDirectNames,
+          directResult.activeDirectNames,
+        );
+        // Pi cannot unregister commands. Wait until cwd is authoritative, and
+        // under the opt-in wait for live metadata, before exposing prompts.
+        if (deferredSnapshot.config.settings?.deferWithMissingMetadata !== true) {
+          registerPromptCommands(resolveCachedPrompts(deferredSnapshot.config));
+        }
+        deliverLargeDirectToolsAdvisory(ctx, deferredSnapshot.config, directResult.specs);
         if (generation !== lifecycleGeneration || !owner.isActive() || currentOwner !== owner) return;
         const serverCount = Object.keys(deferredSnapshot.config.mcpServers).length;
         const formattedStatus = formatMcpFooterStatus(
@@ -1989,7 +2018,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       config.settings?.disableProxyTool !== true
       || directSpecs.length === 0
       || hasSearchModeSpecs
-      || missingConfiguredDirectToolServers.length > 0;
+      || missingConfiguredDirectToolServers.length > 0
+      || hasEnabledServerWithoutValidSurface(config, cache, directSpecs);
 
     if (shouldRegisterProxyTool) {
       const description = buildProxyDescription(config);
